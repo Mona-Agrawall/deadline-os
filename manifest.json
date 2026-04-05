@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Deadline OS",
+  "version": "0.1.0",
+  "description": "Your personal deadline operating system for Gmail",
+  "permissions": [
+    "storage",
+    "identity",
+    "notifications",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://mail.google.com/*",
+    "https://www.googleapis.com/*"
+  ],
+  "oauth2": {
+    "client_id": "30431373016-juoec692bcp234hiavfuktmeqpqhogfc.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/calendar.events",
+      "https://www.googleapis.com/auth/gmail.readonly"
+    ]
+  },
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://mail.google.com/*"],
+      "js": [
+        "content/email-extractor.js",
+        "content/gmail-observer.js",
+        "content/badge-injector.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon16.svg",
+      "48": "assets/icons/icon48.svg",
+      "128": "assets/icons/icon128.svg"
+    }
+  },
+  "icons": {
+    "16": "assets/icons/icon16.svg",
+    "48": "assets/icons/icon48.svg",
+    "128": "assets/icons/icon128.svg"
+  }
+}

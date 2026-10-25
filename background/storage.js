@@ -1,5 +1,6 @@
 // background/storage.js
 // All reads and writes of saved deadlines go through this module.
+// Writes run through withStorageLock() so they never overwrite each other.
 //
 // A saved deadline looks like:
 // {
@@ -8,7 +9,6 @@
 //   category: string,            ← INTERVIEW / ASSIGNMENT / PAYMENT / ...
 //   deadline: string|null,       ← ISO date
 //   deadlineRaw: string|null,    ← date text as written in the email
-//   deadlineDaysFromNow: number|null,
 //   urgency: string,             ← CRITICAL / HIGH / MEDIUM / NORMAL / LOW
 //   score: number,               ← confidence 0.0 – 1.0
 //   action: string,              ← 'auto_save' | 'confirm'
@@ -29,6 +29,21 @@ const Storage = (() => {
     return deadline.status === 'done' || deadline.status === 'dismissed';
   }
 
+  function normalize(text) {
+    return (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  // The same email can reach us twice — opened in Gmail and found by a scan —
+  // with differently formatted received dates, so fingerprints differ.
+  // Same subject, sender and deadline means it's the same deadline.
+  function isSameDeadline(a, b) {
+    return a.id === b.id || (
+      normalize(a.subject) === normalize(b.subject) &&
+      normalize(a.senderEmail) === normalize(b.senderEmail) &&
+      a.deadline === b.deadline
+    );
+  }
+
   async function getAllDeadlines() {
     const result = await chrome.storage.local.get(DEADLINES_KEY);
     return result[DEADLINES_KEY] || [];
@@ -44,33 +59,37 @@ const Storage = (() => {
   }
 
   // Adds a new deadline, keeping the list sorted soonest-first (no date last)
-  async function saveDeadline(deadline) {
-    const deadlines = await getAllDeadlines();
-    if (deadlines.some(d => d.id === deadline.id)) {
-      return { saved: false, reason: 'duplicate' };
-    }
+  function saveDeadline(deadline) {
+    return withStorageLock(async () => {
+      const deadlines = await getAllDeadlines();
+      if (deadlines.some(d => isSameDeadline(d, deadline))) {
+        return { saved: false, reason: 'duplicate' };
+      }
 
-    deadlines.push(deadline);
-    deadlines.sort((a, b) => {
-      if (!a.deadline && !b.deadline) return 0;
-      if (!a.deadline) return 1;
-      if (!b.deadline) return -1;
-      return new Date(a.deadline) - new Date(b.deadline);
+      deadlines.push(deadline);
+      deadlines.sort((a, b) => {
+        if (!a.deadline && !b.deadline) return 0;
+        if (!a.deadline) return 1;
+        if (!b.deadline) return -1;
+        return new Date(a.deadline) - new Date(b.deadline);
+      });
+
+      await saveAllDeadlines(deadlines);
+      return { saved: true };
     });
-
-    await saveAllDeadlines(deadlines);
-    return { saved: true };
   }
 
-  // Merges `changes` into the stored deadline. Returns false if not found.
-  async function updateDeadline(id, changes) {
-    const deadlines = await getAllDeadlines();
-    const deadline = deadlines.find(d => d.id === id);
-    if (!deadline) return false;
+  // Merges `changes` into the stored deadline. Resolves false if not found.
+  function updateDeadline(id, changes) {
+    return withStorageLock(async () => {
+      const deadlines = await getAllDeadlines();
+      const deadline = deadlines.find(d => d.id === id);
+      if (!deadline) return false;
 
-    Object.assign(deadline, changes);
-    await saveAllDeadlines(deadlines);
-    return true;
+      Object.assign(deadline, changes);
+      await saveAllDeadlines(deadlines);
+      return true;
+    });
   }
 
   function updateDeadlineStatus(id, status) {
@@ -145,22 +164,24 @@ const Storage = (() => {
 
   // Deletes done/dismissed deadlines older than CLEANUP_AFTER_DAYS
   // to stay well within the chrome.storage.local quota.
-  async function cleanupOldEntries() {
-    const deadlines = await getAllDeadlines();
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - CLEANUP_AFTER_DAYS);
+  function cleanupOldEntries() {
+    return withStorageLock(async () => {
+      const deadlines = await getAllDeadlines();
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - CLEANUP_AFTER_DAYS);
 
-    const kept = deadlines.filter(d =>
-      !isResolved(d) || new Date(d.updatedAt || d.savedAt) >= cutoff
-    );
+      const kept = deadlines.filter(d =>
+        !isResolved(d) || new Date(d.updatedAt || d.savedAt) >= cutoff
+      );
 
-    if (kept.length < deadlines.length) {
-      await saveAllDeadlines(kept);
-    }
+      if (kept.length < deadlines.length) {
+        await saveAllDeadlines(kept);
+      }
+    });
   }
 
-  async function clearAll() {
-    await chrome.storage.local.clear();
+  function clearAll() {
+    return withStorageLock(() => chrome.storage.local.clear());
   }
 
   return {

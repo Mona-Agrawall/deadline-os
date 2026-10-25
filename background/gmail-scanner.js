@@ -8,10 +8,10 @@
 
 const GmailScanner = (() => {
 
-  const GMAIL_API = 'https://www.googleapis.com/gmail/v1';
   const MAX_RESULTS = 30;
-  const FETCH_DELAY_MS = 150;   // pause between message fetches (rate limiting)
-  const MAX_BODY_LENGTH = 3000; // same cap as the content script
+  const FETCH_DELAY_MS = 150; // pause between message fetches (rate limiting)
+  const LAST_SCAN_TIME_KEY = 'lastScanTime';
+  const LAST_SCAN_RESULTS_KEY = 'lastScanResults';
 
   // ── Gmail search query ─────────────────────────────────────────────
 
@@ -52,7 +52,7 @@ const GmailScanner = (() => {
     'newer_than:7d',
     '-category:promotions -category:social -category:forums',
     EXCLUDED_SENDERS.map(s => `-from:${s}`).join(' '),
-    `{${SEARCH_KEYWORDS.join(' ')}}`,
+    `{${SEARCH_KEYWORDS.map(k => (k.includes(' ') ? `"${k}"` : k)).join(' ')}}`,
   ].join(' ');
 
   // ── Quick pre-filter ───────────────────────────────────────────────
@@ -81,12 +81,13 @@ const GmailScanner = (() => {
     /password reset/i, /verify your email/i, /login alert/i,
   ];
 
-  function shouldSkipEmail(emailData) {
+  // settings: { collegeDomains, careerDomains }
+  function shouldSkipEmail(emailData, settings) {
     const senderEmail = (emailData.sender.email || '').toLowerCase();
-    const senderDomain = senderEmail.split('@')[1] || '';
+    const senderDomain = SenderDomains.getDomain(senderEmail);
     const subject = emailData.subject.toLowerCase();
 
-    if (SenderDomains.isTrusted(senderDomain)) return false;
+    if (SenderDomains.isTrusted(senderDomain, settings)) return false;
     if (SenderDomains.matches(senderDomain, SenderDomains.BLOCKED)) return true;
 
     // Automated senders are skipped unless the subject looks important
@@ -97,80 +98,13 @@ const GmailScanner = (() => {
     return JUNK_SUBJECT_PATTERNS.some(p => p.test(subject));
   }
 
-  // ── Gmail API ──────────────────────────────────────────────────────
-
-  async function gmailApiCall(endpoint) {
-    const response = await Auth.authorizedFetch(`${GMAIL_API}${endpoint}`);
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(`Gmail API ${response.status}: ${err?.error?.message || 'Unknown'}`);
-    }
-    return response.json();
-  }
-
-  // Gmail returns message bodies as base64url-encoded UTF-8
-  function decodeBase64Url(data) {
-    try {
-      const binary = atob(data.replace(/-/g, '+').replace(/_/g, '/'));
-      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-      return new TextDecoder().decode(bytes);
-    } catch (e) {
-      console.warn('[GmailScanner] Could not decode body:', e.message);
-      return '';
-    }
-  }
-
-  function stripHtml(html) {
-    return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  }
-
-  // Walks the MIME tree: plain text first, then HTML, then nested parts
-  function extractBody(payload) {
-    if (payload.body?.data) return decodeBase64Url(payload.body.data);
-    if (!payload.parts) return '';
-
-    const plain = payload.parts.find(p => p.mimeType === 'text/plain' && p.body?.data);
-    if (plain) return decodeBase64Url(plain.body.data);
-
-    const html = payload.parts.find(p => p.mimeType === 'text/html' && p.body?.data);
-    if (html) return stripHtml(decodeBase64Url(html.body.data));
-
-    for (const part of payload.parts) {
-      const nested = part.parts ? extractBody(part) : '';
-      if (nested) return nested;
-    }
-    return '';
-  }
-
-  // Converts a Gmail API message into the same shape the content script sends
-  function toEmailData(message) {
-    const headers = message.payload?.headers || [];
-    const getHeader = (name) =>
-      headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
-
-    // "Name <email@domain.com>" or just "email@domain.com"
-    const from = getHeader('From');
-    const fromMatch = from.match(/^(.+?)\s*<(.+?)>$/);
-
-    return {
-      subject: getHeader('Subject') || '(no subject)',
-      sender: {
-        name: fromMatch ? fromMatch[1].replace(/"/g, '').trim() : from,
-        email: fromMatch ? fromMatch[2].trim() : from,
-      },
-      body: message.payload ? extractBody(message.payload).slice(0, MAX_BODY_LENGTH) : '',
-      receivedDate: getHeader('Date'),
-      url: `https://mail.google.com/mail/u/0/#inbox/${message.id}`,
-    };
-  }
+  // ── Scan ───────────────────────────────────────────────────────────
 
   function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // ── Scan ───────────────────────────────────────────────────────────
-
-  async function scanInbox() {
+  async function runScan() {
     if (!(await Auth.isAuthenticated())) {
       return {
         success: false,
@@ -191,20 +125,19 @@ const GmailScanner = (() => {
     };
 
     try {
-      const list = await gmailApiCall(
-        `/users/me/messages?maxResults=${MAX_RESULTS}&q=${encodeURIComponent(SEARCH_QUERY)}`
-      );
-      const messageIds = (list.messages || []).map(m => m.id);
+      const settings = await Settings.get();
+      const accountEmail = await GmailApi.getAccountEmail().catch(() => null);
+      const messageIds = await GmailApi.listMessageIds(SEARCH_QUERY, MAX_RESULTS);
 
       for (let i = 0; i < messageIds.length; i++) {
         if (i > 0) await delay(FETCH_DELAY_MS);
 
         try {
-          const message = await gmailApiCall(`/users/me/messages/${messageIds[i]}?format=full`);
-          const emailData = toEmailData(message);
+          const message = await GmailApi.getMessage(messageIds[i]);
+          const emailData = GmailApi.toEmailData(message, accountEmail);
           results.scanned++;
 
-          if (shouldSkipEmail(emailData)) {
+          if (shouldSkipEmail(emailData, settings)) {
             results.ignored++;
             continue;
           }
@@ -226,19 +159,30 @@ const GmailScanner = (() => {
 
     results.scanTime = Date.now() - scanStart;
     await chrome.storage.local.set({
-      lastScanTime: new Date().toISOString(),
-      lastScanResults: results,
+      [LAST_SCAN_TIME_KEY]: new Date().toISOString(),
+      [LAST_SCAN_RESULTS_KEY]: results,
     });
 
     console.log('[GmailScanner] Scan complete:', results);
     return results;
   }
 
+  // A scan started while another is running (e.g. the popup's Scan button
+  // during the 30-minute poll) shares the running scan instead of doubling it.
+  let activeScan = null;
+
+  function scanInbox() {
+    if (!activeScan) {
+      activeScan = runScan().finally(() => { activeScan = null; });
+    }
+    return activeScan;
+  }
+
   async function getScanStatus() {
-    const data = await chrome.storage.local.get(['lastScanTime', 'lastScanResults']);
+    const data = await chrome.storage.local.get([LAST_SCAN_TIME_KEY, LAST_SCAN_RESULTS_KEY]);
     return {
-      lastScanTime: data.lastScanTime || null,
-      lastScanResults: data.lastScanResults || null,
+      lastScanTime: data[LAST_SCAN_TIME_KEY] || null,
+      lastScanResults: data[LAST_SCAN_RESULTS_KEY] || null,
     };
   }
 

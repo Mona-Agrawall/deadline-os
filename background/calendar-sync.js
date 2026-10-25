@@ -22,13 +22,11 @@ const CalendarSync = (() => {
       if (deadline.calendarEventId) return { synced: false, reason: 'already_synced' };
 
       const result = await Calendar.createEvent(deadline);
-      if (result.created) {
-        await Storage.updateDeadline(deadlineId, {
-          calendarEventId: result.eventId,
-          calendarLink: result.htmlLink,
-          status: 'synced',
-        });
-      }
+      await Storage.updateDeadline(deadlineId, {
+        calendarEventId: result.eventId,
+        calendarLink: result.htmlLink,
+        status: 'synced',
+      });
       return result;
     } catch (err) {
       console.error('[CalendarSync] Sync failed:', err.message);
@@ -37,34 +35,44 @@ const CalendarSync = (() => {
     }
   }
 
+  // ── Retry queue ────────────────────────────────────────────────────
+
   async function getRetryQueue() {
     const result = await chrome.storage.local.get(RETRY_QUEUE_KEY);
     return result[RETRY_QUEUE_KEY] || [];
   }
 
-  async function addToRetryQueue(deadlineId) {
-    const queue = await getRetryQueue();
-    if (queue.some(item => item.deadlineId === deadlineId)) return;
+  function addToRetryQueue(deadlineId) {
+    return withStorageLock(async () => {
+      const queue = await getRetryQueue();
+      if (queue.some(item => item.deadlineId === deadlineId)) return;
 
-    queue.push({ deadlineId, addedAt: new Date().toISOString(), attempts: 0 });
-    await chrome.storage.local.set({ [RETRY_QUEUE_KEY]: queue.slice(-MAX_QUEUE_SIZE) });
+      queue.push({ deadlineId, addedAt: new Date().toISOString(), attempts: 0 });
+      await chrome.storage.local.set({ [RETRY_QUEUE_KEY]: queue.slice(-MAX_QUEUE_SIZE) });
+    });
   }
 
   async function processRetryQueue() {
     const queue = await getRetryQueue();
     if (queue.length === 0 || !(await Auth.isAuthenticated())) return;
 
-    const remaining = [];
+    const attempts = new Map(); // deadlineId → attempts so far, for items that failed again
     for (const item of queue) {
       const result = await syncDeadline(item.deadlineId);
       const failed = result.synced === false && !FINAL_REASONS.includes(result.reason);
-      if (!failed) continue;
-
-      item.attempts++;
-      if (item.attempts < MAX_ATTEMPTS) remaining.push(item);
+      if (failed) attempts.set(item.deadlineId, item.attempts + 1);
     }
 
-    await chrome.storage.local.set({ [RETRY_QUEUE_KEY]: remaining });
+    // Re-read the queue so items added while we were syncing are kept
+    await withStorageLock(async () => {
+      const processedIds = new Set(queue.map(item => item.deadlineId));
+      const current = await getRetryQueue();
+      const remaining = current
+        .map(item => (attempts.has(item.deadlineId) ? { ...item, attempts: attempts.get(item.deadlineId) } : item))
+        .filter(item => !processedIds.has(item.deadlineId) || attempts.get(item.deadlineId) < MAX_ATTEMPTS);
+
+      await chrome.storage.local.set({ [RETRY_QUEUE_KEY]: remaining });
+    });
   }
 
   return { syncDeadline, processRetryQueue };

@@ -91,30 +91,11 @@ const Parser = (() => {
     }
   };
 
-  // ── Date patterns ──────────────────────────────────────────────────
-  // Phrases that usually contain or precede a date. Capture group 1 is
-  // the date text handed to DateUtils.parse().
-  const DATE_CONTEXT_PATTERNS = [
-    // Explicit deadline language
-    /(?:due|deadline|by|before|submit(?:ted)?\s+by|no\s+later\s+than|closes?\s+on|ends?\s+on)\s*[:\-]?\s*([^.\n]{3,40})/gi,
-    // Scheduled time language
-    /(?:scheduled\s+(?:for|on)|at|on|starts?\s+(?:at|on))\s+([^.\n]{3,40})/gi,
-    // Date-first patterns
-    /(?:date\s*[:\-]\s*)([^.\n]{3,40})/gi,
-    // "by [date]" patterns
-    /\bby\s+((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}[^.\n]{0,20})/gi,
-    // ISO and slash dates standalone
-    /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/gi,
-    // "April 5", "5th April" patterns
-    /\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*(?:\s*,?\s*\d{4})?)\b/gi,
-    /\b((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*,?\s*\d{4})?)\b/gi,
-    // Relative dates
-    /\b(today|tomorrow|this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|in\s+\d+\s+days?)\b/gi,
-    // "Complete by", "expires on", "link valid till" — HireVue / interview platforms
-    /(?:complete\s+by|expires?\s+on|valid\s+(?:till|until|through)|available\s+(?:till|until))\s*[:\-]?\s*([^.\n]{3,40})/gi,
-    // "last date" standalone
-    /(?:last\s+date)\s*[:\-]?\s*([^.\n]{3,40})/gi,
-  ];
+  // Words that, shortly before a date, mark it as the deadline itself
+  // ("due 15 March", "last date: 12/03") rather than an incidental date.
+  const DEADLINE_CONTEXT_REGEX =
+    /\b(due|deadline|by|before|until|till|no later than|last date|closes?|ends?|expires?|valid|submit|scheduled|starts?|on|at|date)\b[^.\n]{0,25}$/i;
+  const CONTEXT_CHARS = 40;
 
   // ── Urgency signals ────────────────────────────────────────────────
   const URGENCY_SIGNALS = {
@@ -159,39 +140,19 @@ const Parser = (() => {
     return results;
   }
 
-  function extractDateCandidates(text) {
-    const found = new Set();
-    const candidates = [];
+  // All dates in the text, best first: future before past, deadline
+  // wording before incidental mentions, then soonest first
+  function extractDateCandidates(text, { dateOrder, now = new Date() }) {
+    const candidates = DateParser.findDates(text, { dateOrder, now }).map(({ raw, date, index }) => ({
+      raw,
+      date,
+      isFuture: date > now,
+      inContext: DEADLINE_CONTEXT_REGEX.test(text.slice(Math.max(0, index - CONTEXT_CHARS), index)),
+    }));
 
-    for (const pattern of DATE_CONTEXT_PATTERNS) {
-      pattern.lastIndex = 0; // global regexes keep state between calls
-      let match;
-      while ((match = pattern.exec(text)) !== null) {
-        const raw = (match[1] || match[0]).trim();
-        if (raw.length < 3 || raw.length > 60) continue;
-        if (found.has(raw.toLowerCase())) continue;
-        found.add(raw.toLowerCase());
-
-        const parsed = DateUtils.parse(raw);
-        if (parsed) {
-          candidates.push({
-            raw,
-            date: parsed,
-            isFuture: DateUtils.isInFuture(parsed),
-            daysFromNow: DateUtils.daysFromNow(parsed),
-          });
-        }
-      }
-    }
-
-    // Future dates first, then soonest first
-    candidates.sort((a, b) => {
-      if (a.isFuture && !b.isFuture) return -1;
-      if (!a.isFuture && b.isFuture) return 1;
-      return a.date - b.date;
-    });
-
-    return candidates;
+    return candidates.sort((a, b) =>
+      (b.isFuture - a.isFuture) || (b.inContext - a.inContext) || (a.date - b.date)
+    );
   }
 
   function detectUrgency(text) {
@@ -221,11 +182,12 @@ const Parser = (() => {
 
   // ── Main ───────────────────────────────────────────────────────────
 
-  function parse(emailData) {
+  // options: { dateOrder: 'DMY' | 'MDY', now?: Date }
+  function parse(emailData, options = {}) {
     const fullText = `${emailData.subject || ''}\n${emailData.body || ''}`;
 
     const categoryMatches = findCategoryMatches(fullText);
-    const dateCandidates = extractDateCandidates(fullText);
+    const dateCandidates = extractDateCandidates(fullText, options);
     const bestDate = dateCandidates[0] || null;
     const senderEmail = emailData.sender?.email;
 
@@ -234,7 +196,7 @@ const Parser = (() => {
       emailSubject: emailData.subject,
       senderName: emailData.sender?.name,
       senderEmail,
-      senderDomain: senderEmail ? senderEmail.split('@')[1] || null : null,
+      senderDomain: SenderDomains.getDomain(senderEmail),
       emailUrl: emailData.url,
       body: emailData.body || '',
 
@@ -244,7 +206,6 @@ const Parser = (() => {
       dateCandidates,
       deadline: bestDate ? bestDate.date.toISOString() : null,
       deadlineRaw: bestDate ? bestDate.raw : null,
-      deadlineDaysFromNow: bestDate ? bestDate.daysFromNow : null,
       urgency: detectUrgency(fullText),
     };
   }

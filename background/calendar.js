@@ -24,16 +24,16 @@ const Calendar = (() => {
     return `deadlineos-${deadline.id}@gmail.deadline`;
   }
 
-  async function eventExists(iCalUID, calendarId) {
+  async function findExistingEvent(iCalUID, calendarId) {
     try {
       const result = await apiCall(
         'GET',
         `/calendars/${encodeURIComponent(calendarId)}/events?iCalUID=${encodeURIComponent(iCalUID)}&maxResults=1`
       );
-      return result?.items?.length > 0;
+      return result?.items?.[0] || null;
     } catch (e) {
       console.warn('[Calendar] Could not check for existing event:', e.message);
-      return false; // safer to try creating it
+      return null; // safer to try creating it
     }
   }
 
@@ -102,20 +102,18 @@ const Calendar = (() => {
     };
   }
 
+  // Returns { created, eventId, htmlLink, iCalUID } — `created` is false when
+  // the event already existed (e.g. created before the extension was reinstalled)
   async function createEvent(deadline, calendarId = 'primary') {
     const event = buildEvent(deadline);
 
-    if (await eventExists(event.iCalUID, calendarId)) {
-      return { created: false, reason: 'already_exists', iCalUID: event.iCalUID };
+    const existing = await findExistingEvent(event.iCalUID, calendarId);
+    if (existing) {
+      return { created: false, reason: 'already_exists', eventId: existing.id, htmlLink: existing.htmlLink, iCalUID: event.iCalUID };
     }
 
     const created = await apiCall('POST', `/calendars/${encodeURIComponent(calendarId)}/events`, event);
-    return {
-      created: true,
-      eventId: created.id,
-      iCalUID: event.iCalUID,
-      htmlLink: created.htmlLink,
-    };
+    return { created: true, eventId: created.id, htmlLink: created.htmlLink, iCalUID: event.iCalUID };
   }
 
   return { createEvent };

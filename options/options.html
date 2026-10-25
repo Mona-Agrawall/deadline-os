@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deadline OS — Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="page">
+    <h1>⏰ Deadline OS settings</h1>
+
+    <form id="settingsForm">
+      <section class="field">
+        <h2>Date format</h2>
+        <p class="hint">How should a date like <code>03/04/2027</code> be read?</p>
+        <label><input type="radio" name="dateOrder" value="DMY"> Day first — 3 April 2027 (India, UK, most of the world)</label>
+        <label><input type="radio" name="dateOrder" value="MDY"> Month first — March 4, 2027 (US)</label>
+      </section>
+
+      <section class="field">
+        <h2>Reminders</h2>
+        <p class="hint">When to show a desktop notification before each deadline.</p>
+        <div class="checkbox-grid">
+          <label><input type="checkbox" name="reminderMinutes" value="2880"> 2 days before</label>
+          <label><input type="checkbox" name="reminderMinutes" value="1440"> 1 day before</label>
+          <label><input type="checkbox" name="reminderMinutes" value="180"> 3 hours before</label>
+          <label><input type="checkbox" name="reminderMinutes" value="60"> 1 hour before</label>
+          <label><input type="checkbox" name="reminderMinutes" value="30"> 30 minutes before</label>
+          <label><input type="checkbox" name="reminderMinutes" value="15"> 15 minutes before</label>
+        </div>
+      </section>
+
+      <section class="field">
+        <h2>College / university domains</h2>
+        <p class="hint">Emails from these domains are trusted most. One domain per line, e.g. <code>srmist.edu.in</code>.</p>
+        <textarea name="collegeDomains" rows="4" spellcheck="false"></textarea>
+      </section>
+
+      <section class="field">
+        <h2>Career &amp; recruiting domains</h2>
+        <p class="hint">Placement platforms and companies you're applying to. One domain per line.</p>
+        <textarea name="careerDomains" rows="8" spellcheck="false"></textarea>
+      </section>
+
+      <div class="actions">
+        <button type="submit" class="btn btn-primary">Save</button>
+        <button type="button" class="btn" id="resetBtn">Reset to defaults</button>
+        <span class="status" id="status" role="status"></span>
+      </div>
+    </form>
+  </main>
+
+  <script src="options.js"></script>
+</body>
+</html>

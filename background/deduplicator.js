@@ -41,13 +41,15 @@ const Deduplicator = (() => {
   }
 
   // Remembers the id; the oldest ids are dropped once the cap is reached
-  async function markProcessed(id) {
-    const processedIds = await getProcessedIds();
-    if (processedIds.includes(id)) return;
+  function markProcessed(id) {
+    return withStorageLock(async () => {
+      const processedIds = await getProcessedIds();
+      if (processedIds.includes(id)) return;
 
-    processedIds.push(id);
-    await chrome.storage.local.set({
-      [PROCESSED_IDS_KEY]: processedIds.slice(-MAX_PROCESSED_IDS),
+      processedIds.push(id);
+      await chrome.storage.local.set({
+        [PROCESSED_IDS_KEY]: processedIds.slice(-MAX_PROCESSED_IDS),
+      });
     });
   }
 

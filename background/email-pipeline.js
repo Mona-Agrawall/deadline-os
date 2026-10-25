@@ -16,7 +16,6 @@ const EmailPipeline = (() => {
       category: parsed.category,
       deadline: parsed.deadline,
       deadlineRaw: parsed.deadlineRaw,
-      deadlineDaysFromNow: parsed.deadlineDaysFromNow,
       urgency: parsed.urgency,
       score,
       action,
@@ -34,8 +33,9 @@ const EmailPipeline = (() => {
     const id = Deduplicator.fingerprint(emailData);
     if (await Deduplicator.isDuplicate(id)) return { status: 'duplicate' };
 
-    const parsed = Parser.parse(emailData);
-    const { score, action, reasons } = Scorer.score(parsed);
+    const settings = await Settings.get();
+    const parsed = Parser.parse(emailData, { dateOrder: settings.dateOrder });
+    const { score, action, reasons } = Scorer.score(parsed, settings);
     console.log(`[Pipeline] "${emailData.subject}" → ${parsed.category} (${score}) → ${action}`, reasons);
 
     if (action === 'ignore') return { status: 'ignored', score };
@@ -45,7 +45,7 @@ const EmailPipeline = (() => {
     await Deduplicator.markProcessed(id);
     if (!saved) return { status: 'duplicate' };
 
-    await Notifier.scheduleReminders(deadline);
+    Notifier.scheduleReminders(deadline, settings.reminderMinutes);
     if (action === 'auto_save') {
       await CalendarSync.syncDeadline(id);
     }

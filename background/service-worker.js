@@ -5,13 +5,16 @@
 
 importScripts(
   '/utils/categories.js',
-  '/utils/date-utils.js',
   '/utils/sender-domains.js',
+  '/background/storage-lock.js',
+  '/background/settings.js',
   '/background/storage.js',
   '/background/deduplicator.js',
+  '/background/date-parser.js',
   '/background/parser.js',
   '/background/scorer.js',
   '/background/auth.js',
+  '/background/gmail-api.js',
   '/background/calendar.js',
   '/background/calendar-sync.js',
   '/background/notifier.js',
@@ -88,9 +91,22 @@ const MESSAGE_HANDLERS = {
   CHECK_AUTH: async () => ({ authenticated: await Auth.isAuthenticated() }),
   AUTHENTICATE: () => Auth.authenticate(),
 
+  // From the popup and the options page
+  GET_SETTINGS: () => Settings.get(),
+  SAVE_SETTINGS: async ({ settings }) => {
+    const saved = await Settings.save(settings);
+    await Notifier.rescheduleAll(); // reminder times may have changed
+    return saved;
+  },
+  RESET_SETTINGS: async () => {
+    const defaults = await Settings.reset();
+    await Notifier.rescheduleAll();
+    return defaults;
+  },
+
   UPDATE_STATUS: async ({ id, status }) => {
     const updated = await Storage.updateDeadlineStatus(id, status);
-    if (status === 'done' || status === 'dismissed') Notifier.cancelReminders(id);
+    if (status === 'done' || status === 'dismissed') await Notifier.cancelReminders(id);
     return updated;
   },
 

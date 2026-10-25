@@ -5,11 +5,10 @@
 
 const Notifier = (() => {
 
-  const REMINDER_MINUTES = [1440, 60, 15]; // 24 hours, 1 hour, 15 minutes before
   const ALARM_PREFIX = 'deadline_';
   const NOTIFICATION_PREFIX = 'deadlineos_';
   const OVERDUE_TAG = 'overdue';
-  const ICON_PATH = 'assets/icons/icon128.svg';
+  const ICON_PATH = 'assets/icons/icon128.png';
 
   function alarmName(deadlineId, minutes) {
     return `${ALARM_PREFIX}${deadlineId}_${minutes}`;
@@ -17,11 +16,12 @@ const Notifier = (() => {
 
   // ── Scheduling ─────────────────────────────────────────────────────
 
-  async function scheduleReminders(deadline) {
+  // reminderMinutes: e.g. [1440, 60, 15] from the user's settings
+  function scheduleReminders(deadline, reminderMinutes) {
     if (!deadline.deadline) return;
 
     const deadlineTime = new Date(deadline.deadline).getTime();
-    for (const minutes of REMINDER_MINUTES) {
+    for (const minutes of reminderMinutes) {
       const when = deadlineTime - minutes * 60 * 1000;
       if (when > Date.now()) {
         chrome.alarms.create(alarmName(deadline.id, minutes), { when });
@@ -29,26 +29,35 @@ const Notifier = (() => {
     }
   }
 
-  function cancelReminders(deadlineId) {
-    for (const minutes of REMINDER_MINUTES) {
-      chrome.alarms.clear(alarmName(deadlineId, minutes));
-    }
+  async function clearAlarms(namePrefix) {
+    const alarms = await chrome.alarms.getAll();
+    await Promise.all(alarms
+      .filter(alarm => alarm.name.startsWith(namePrefix))
+      .map(alarm => chrome.alarms.clear(alarm.name)));
   }
 
-  // Alarms can be lost when the browser restarts, so recreate them on launch
+  function cancelReminders(deadlineId) {
+    return clearAlarms(`${ALARM_PREFIX}${deadlineId}_`);
+  }
+
+  // Rebuilds every reminder from scratch. Runs on browser launch (alarms can
+  // be lost on restart) and when the user changes their reminder times.
   async function rescheduleAll() {
-    const deadlines = await Storage.getAllDeadlines();
+    await clearAlarms(ALARM_PREFIX);
+    const [deadlines, settings] = await Promise.all([Storage.getAllDeadlines(), Settings.get()]);
     for (const deadline of deadlines) {
-      if (!Storage.isResolved(deadline)) await scheduleReminders(deadline);
+      if (!Storage.isResolved(deadline)) scheduleReminders(deadline, settings.reminderMinutes);
     }
   }
 
   // ── Showing notifications ──────────────────────────────────────────
 
+  // 2880 → "in 2 days", 180 → "in 3 hours", 15 → "in 15 minutes"
   function formatTimeLeft(minutes) {
-    if (minutes >= 1440) return `in ${Math.round(minutes / 60)} hours`;
-    if (minutes >= 60) return `in ${Math.round(minutes / 60)} hour${minutes >= 120 ? 's' : ''}`;
-    return `in ${minutes} minutes`;
+    const plural = (n, unit) => `in ${n} ${unit}${n === 1 ? '' : 's'}`;
+    if (minutes >= 1440) return plural(Math.round(minutes / 1440), 'day');
+    if (minutes >= 60) return plural(Math.round(minutes / 60), 'hour');
+    return plural(minutes, 'minute');
   }
 
   function showNotification(notificationId, title, deadline, requireInteraction) {
@@ -111,7 +120,7 @@ const Notifier = (() => {
 
   async function markDone(deadlineId) {
     await Storage.updateDeadlineStatus(deadlineId, 'done');
-    cancelReminders(deadlineId);
+    await cancelReminders(deadlineId);
   }
 
   // Clicking the notification body does the same as the "Open Email" button (index 0)

@@ -1,14 +1,13 @@
 // utils/sender-domains.js
-// Lists of sender domains used to trust, penalise or skip emails.
-// Shared by the service worker (scanner + scorer) and the popup.
+// Sender domain lists used to trust, penalise or skip emails.
+// The college and career lists are only defaults — users can change them
+// on the settings page. Shared by the service worker and the popup.
 
 const SenderDomains = (() => {
 
-  // College / university — highest trust
-  const COLLEGE = ['srmist.edu.in', 'srm.edu.in', 'srmuniv.ac.in'];
+  const DEFAULT_COLLEGE = ['srmist.edu.in', 'srm.edu.in', 'srmuniv.ac.in'];
 
-  // Placement platforms and recruiting companies — high trust
-  const CAREER = [
+  const DEFAULT_CAREER = [
     'haveloc.com', 'hirevue.com', 'hackerrank.com', 'codility.com',
     'unstop.com', 'dare2compete.com', 'naukri.com', 'internshala.com',
     'jpmorganchase.com', 'jpmorgan.com', 'capgemini.com',
@@ -51,15 +50,20 @@ const SenderDomains = (() => {
     'amazon.com', 'flipkart.com', 'myntra.com', 'swiggy.in', 'zomato.com',
   ];
 
-  // True if `domain` is one of `list` or a subdomain of one (e.g. mail.srmist.edu.in)
+  // True if `domain` is in `list` or is a subdomain of an entry (mail.srmist.edu.in)
   function matches(domain, list) {
     if (!domain) return false;
     return list.some(d => domain === d || domain.endsWith(`.${d}`));
   }
 
-  function isTrusted(domain) {
-    return matches(domain, COLLEGE) || matches(domain, CAREER);
+  // College and career senders are always processed and never penalised
+  function isTrusted(domain, { collegeDomains, careerDomains }) {
+    return matches(domain, collegeDomains) || matches(domain, careerDomains);
   }
 
-  return { COLLEGE, CAREER, PERSONAL, MARKETING, BLOCKED, matches, isTrusted };
+  function getDomain(email) {
+    return (email || '').toLowerCase().split('@')[1] || null;
+  }
+
+  return { DEFAULT_COLLEGE, DEFAULT_CAREER, PERSONAL, MARKETING, BLOCKED, matches, isTrusted, getDomain };
 })();

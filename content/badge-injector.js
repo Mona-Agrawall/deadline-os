@@ -61,20 +61,16 @@
     });
   }
 
-  // Exact match, substring match (Gmail truncates subjects), or 3+ shared words
+  function normalizeSubject(subject) {
+    return (subject || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  // Only an exact subject match counts — looser matching badged unrelated emails
   function findMatchingDeadline(rowSubject) {
-    const row = rowSubject.toLowerCase().trim();
-    const rowWords = row.split(/\s+/).filter(w => w.length > 2);
-
-    return deadlines.find((d) => {
-      if (!d.subject || d.status === 'done' || d.status === 'dismissed') return false;
-
-      const subject = d.subject.toLowerCase().trim();
-      if (row.includes(subject) || subject.includes(row)) return true;
-
-      const subjectWords = subject.split(/\s+/).filter(w => w.length > 2);
-      return rowWords.filter(w => subjectWords.includes(w)).length >= 3;
-    }) || null;
+    const subject = normalizeSubject(rowSubject);
+    return deadlines.find(d =>
+      d.status !== 'done' && d.status !== 'dismissed' && normalizeSubject(d.subject) === subject
+    ) || null;
   }
 
   function getUrgencyClass(deadline) {

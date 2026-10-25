@@ -111,7 +111,8 @@ const Scorer = (() => {
 
   const containsAny = (text, phrases) => phrases.some(p => text.includes(p));
 
-  function score(parsed) {
+  // settings: { collegeDomains, careerDomains } — see background/settings.js
+  function score(parsed, settings) {
     let raw = 0;
     const reasons = [];
     const add = (weight, reason) => {
@@ -153,9 +154,9 @@ const Scorer = (() => {
 
     // 4. Sender trust
     if (domain) {
-      if (SenderDomains.matches(domain, SenderDomains.COLLEGE)) {
+      if (SenderDomains.matches(domain, settings.collegeDomains)) {
         add(WEIGHTS.COLLEGE_DOMAIN, `College domain: ${domain}`);
-      } else if (SenderDomains.matches(domain, SenderDomains.CAREER)) {
+      } else if (SenderDomains.matches(domain, settings.careerDomains)) {
         add(WEIGHTS.CAREER_DOMAIN, `Career platform: ${domain}`);
       } else if (SenderDomains.PERSONAL.includes(domain)) {
         add(WEIGHTS.PERSONAL_DOMAIN, 'Personal email domain');
@@ -182,7 +183,7 @@ const Scorer = (() => {
     if (containsAny(subject, PROMOTIONAL_SUBJECT_WORDS)) {
       add(WEIGHTS.PROMOTIONAL_SUBJECT, 'Promotional subject');
     }
-    if (containsAny(senderEmail, AUTOMATED_SENDER_MARKERS) && !SenderDomains.isTrusted(domain)) {
+    if (containsAny(senderEmail, AUTOMATED_SENDER_MARKERS) && !SenderDomains.isTrusted(domain, settings)) {
       add(WEIGHTS.AUTOMATED_SENDER, 'Automated / no-reply sender');
     }
 

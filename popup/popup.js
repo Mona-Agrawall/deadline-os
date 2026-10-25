@@ -13,6 +13,8 @@ const connectBtn = document.getElementById('connectCalBtn');
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SNOOZE_HOURS = 24;
 
+let collegeDomains = []; // from settings, used for the "College" label on cards
+
 const SECTIONS = [
   { key: 'overdue', title: 'Overdue', dot: 'dot-overdue' },
   { key: 'today', title: 'Today', dot: 'dot-today' },
@@ -55,7 +57,7 @@ function describeDueDate(isoString) {
   if (days === 0) return { text: 'Due today', cls: 'soon', days };
   if (days === 1) return { text: 'Due tomorrow', cls: 'soon', days };
   if (days <= 7) return { text: `In ${days} days`, cls: '', days };
-  return { text: date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }), cls: '', days };
+  return { text: date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), cls: '', days };
 }
 
 function formatTimeAgo(isoString) {
@@ -67,10 +69,10 @@ function formatTimeAgo(isoString) {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function getAccountLabel(email) {
-  const domain = (email || '').split('@')[1];
-  if (SenderDomains.matches(domain, SenderDomains.COLLEGE)) return 'SRM';
-  if (domain === 'gmail.com') return 'Personal';
+function getSenderLabel(email) {
+  const domain = SenderDomains.getDomain(email);
+  if (SenderDomains.matches(domain, collegeDomains)) return 'College';
+  if (SenderDomains.PERSONAL.includes(domain)) return 'Personal';
   return '';
 }
 
@@ -92,7 +94,7 @@ function buildDaysCounter(due) {
 function buildCard(deadline, needsReview) {
   const due = describeDueDate(deadline.deadline);
   const category = deadline.category || 'UNKNOWN';
-  const accountLabel = getAccountLabel(deadline.senderEmail);
+  const senderLabel = getSenderLabel(deadline.senderEmail);
   const id = escapeHtml(deadline.id);
 
   const dateHtml = due
@@ -123,7 +125,7 @@ function buildCard(deadline, needsReview) {
         <span class="badge badge-${escapeHtml(category)}">${escapeHtml(category)}</span>
         ${dateHtml}
         ${deadline.senderName ? `<span class="card-sender">${escapeHtml(deadline.senderName)}</span>` : ''}
-        ${accountLabel ? `<span class="card-account">${accountLabel}</span>` : ''}
+        ${senderLabel ? `<span class="card-account">${senderLabel}</span>` : ''}
         ${deadline.calendarEventId ? '<span class="card-cal-status">📅 ✓</span>' : ''}
       </div>
       <div class="card-actions">
@@ -156,7 +158,11 @@ function buildSection(title, dotClass, deadlines, needsReview = false) {
 async function render() {
   content.innerHTML = stateMessage('⏳', 'Loading...');
 
-  const buckets = await sendMessage({ type: 'GET_DEADLINES' });
+  const [buckets, settings] = await Promise.all([
+    sendMessage({ type: 'GET_DEADLINES' }),
+    sendMessage({ type: 'GET_SETTINGS' }),
+  ]);
+  collegeDomains = settings?.collegeDomains || [];
   if (!buckets) {
     content.innerHTML = stateMessage('⚠️', 'Could not load deadlines.<br>Try refreshing.');
     return;
@@ -324,6 +330,10 @@ content.addEventListener('click', async (e) => {
       return;
   }
   render();
+});
+
+document.getElementById('settingsBtn').addEventListener('click', () => {
+  chrome.runtime.openOptionsPage();
 });
 
 document.getElementById('refreshBtn').addEventListener('click', () => {

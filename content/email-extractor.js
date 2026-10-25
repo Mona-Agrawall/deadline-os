@@ -1,51 +1,45 @@
 // content/email-extractor.js
-// Responsible for extracting structured data from an open Gmail email.
-// Uses a layered selector strategy: try the most stable selectors first,
-// fall back gracefully. Never throw — always return what we can.
+// Reads the currently open Gmail email from the page.
+// Each field has a list of selectors, most stable first, so a Gmail UI
+// change to one selector falls back to the next.
 
 const EmailExtractor = (() => {
 
-  // These selectors are ordered by stability (most stable first).
-  // Gmail's h2 for subject has been consistent for years.
-  // If Gmail updates break one, the next is tried.
+  const MAX_BODY_LENGTH = 3000;
+
   const SUBJECT_SELECTORS = [
-    'h2.hP',                          // primary — very stable
-    '[data-thread-perm-id] h2',       // fallback 1
-    '.ha h2',                         // fallback 2
+    'h2.hP',
+    '[data-thread-perm-id] h2',
+    '.ha h2',
   ];
 
   const BODY_SELECTORS = [
-    '.a3s.aiL',                       // primary — the actual email body div
-    '.a3s',                           // fallback 1
-    '[data-message-id] .ii.gt div',   // fallback 2
+    '.a3s.aiL',
+    '.a3s',
+    '[data-message-id] .ii.gt div',
   ];
 
   const SENDER_SELECTORS = [
-    '.gD',                            // sender name span — very stable
-    '[email].go',                     // sender with email attr
+    '.gD',            // sender name span (has name + email attributes)
+    '[email].go',
   ];
 
   const DATE_SELECTORS = [
-    '.g3',                            // date string in email header
-    '[data-hovercard-id] + span .g3', // fallback
-    'span[title*="202"]',             // any span whose title contains a year
+    '.g3',
+    '[data-hovercard-id] + span .g3',
+    'span[title*="202"]', // any span whose title contains a year
   ];
 
-  function queryFirst(selectors, context = document) {
-    for (const sel of selectors) {
-      try {
-        const el = context.querySelector(sel);
-        if (el) return el;
-      } catch (e) {
-        // Invalid selector — skip silently
-      }
+  function queryFirst(selectors) {
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (el) return el;
     }
     return null;
   }
 
   function extractSubject() {
-    const el = queryFirst(SUBJECT_SELECTORS);
-    return el ? el.innerText.trim() : null;
+    return queryFirst(SUBJECT_SELECTORS)?.innerText.trim() || null;
   }
 
   function extractSender() {
@@ -58,34 +52,27 @@ const EmailExtractor = (() => {
   }
 
   function extractBody() {
-    const el = queryFirst(BODY_SELECTORS);
-    if (!el) return null;
-    // Get text only — strip HTML tags
-    return el.innerText.trim().slice(0, 3000); // cap at 3000 chars for now
+    return queryFirst(BODY_SELECTORS)?.innerText.trim().slice(0, MAX_BODY_LENGTH) || null;
   }
 
-  function extractDate() {
+  // The title holds the full date ("Apr 2, 2026, 10:30 AM"); the text may be just "10:30 AM"
+  function extractReceivedDate() {
     const el = queryFirst(DATE_SELECTORS);
     if (!el) return null;
-    // Gmail shows dates like "Apr 2, 2026, 10:30 AM" or just "10:30 AM" for today
     return el.getAttribute('title') || el.innerText.trim();
   }
 
+  // Returns null when neither a subject nor a body could be found
   function extract() {
     const subject = extractSubject();
-    const sender = extractSender();
     const body = extractBody();
-    const receivedDate = extractDate();
-
-    // Only return if we have at least subject or body
     if (!subject && !body) return null;
 
     return {
       subject,
-      sender,
+      sender: extractSender(),
       body,
-      receivedDate,
-      extractedAt: new Date().toISOString(),
+      receivedDate: extractReceivedDate(),
       url: window.location.href,
     };
   }

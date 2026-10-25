@@ -1,15 +1,12 @@
 // background/parser.js
-// Scans email subject + body for deadline signals.
-// Returns a structured DeadlineCandidate or null.
-// Rule-based first — deterministic and trustworthy.
-
-// Must be imported before scorer.js in service-worker.js
+// Reads an email's subject + body and extracts deadline signals:
+// category, candidate dates, and urgency. Purely rule-based, so the
+// result is deterministic and easy to reason about.
 
 const Parser = (() => {
 
-  // ── Category keyword maps ──────────────────────────────────────────
-  // Each category has STRONG triggers (high confidence) and
-  // WEAK triggers (need corroboration from date evidence)
+  // ── Category keywords ──────────────────────────────────────────────
+  // STRONG keywords are enough on their own; WEAK ones need two or more hits.
 
   const CATEGORIES = {
     INTERVIEW: {
@@ -94,8 +91,9 @@ const Parser = (() => {
     }
   };
 
-  // ── Date-bearing phrase patterns ───────────────────────────────────
-  // These are phrases that typically PRECEDE or CONTAIN a date
+  // ── Date patterns ──────────────────────────────────────────────────
+  // Phrases that usually contain or precede a date. Capture group 1 is
+  // the date text handed to DateUtils.parse().
   const DATE_CONTEXT_PATTERNS = [
     // Explicit deadline language
     /(?:due|deadline|by|before|submit(?:ted)?\s+by|no\s+later\s+than|closes?\s+on|ends?\s+on)\s*[:\-]?\s*([^.\n]{3,40})/gi,
@@ -166,7 +164,7 @@ const Parser = (() => {
     const candidates = [];
 
     for (const pattern of DATE_CONTEXT_PATTERNS) {
-      pattern.lastIndex = 0; // Reset global regex
+      pattern.lastIndex = 0; // global regexes keep state between calls
       let match;
       while ((match = pattern.exec(text)) !== null) {
         const raw = (match[1] || match[0]).trim();
@@ -186,7 +184,7 @@ const Parser = (() => {
       }
     }
 
-    // Sort: prefer future dates, then soonest first
+    // Future dates first, then soonest first
     candidates.sort((a, b) => {
       if (a.isFuture && !b.isFuture) return -1;
       if (!a.isFuture && b.isFuture) return 1;
@@ -221,54 +219,34 @@ const Parser = (() => {
     return best;
   }
 
-  // ── Main parse function ────────────────────────────────────────────
+  // ── Main ───────────────────────────────────────────────────────────
 
   function parse(emailData) {
-    if (!emailData) return null;
-
     const fullText = `${emailData.subject || ''}\n${emailData.body || ''}`;
 
-    // 1. Find category matches
     const categoryMatches = findCategoryMatches(fullText);
-    const category = pickBestCategory(categoryMatches);
-
-    // 2. Extract date candidates from body
     const dateCandidates = extractDateCandidates(fullText);
     const bestDate = dateCandidates[0] || null;
+    const senderEmail = emailData.sender?.email;
 
-    // 3. Detect urgency
-    const urgency = detectUrgency(fullText);
-
-    // 4. Extract sender info
-    const senderDomain = emailData.sender?.email
-      ? emailData.sender.email.split('@')[1] || null
-      : null;
-
-    // 5. Build result
-    const result = {
-      // Source
+    return {
+      // From the email
       emailSubject: emailData.subject,
       senderName: emailData.sender?.name,
-      senderEmail: emailData.sender?.email,
-      senderDomain,
-      receivedDate: emailData.receivedDate,
+      senderEmail,
+      senderDomain: senderEmail ? senderEmail.split('@')[1] || null : null,
       emailUrl: emailData.url,
+      body: emailData.body || '',
 
-      // Extracted
-      category: category || 'UNKNOWN',
+      // Extracted signals
+      category: pickBestCategory(categoryMatches) || 'UNKNOWN',
       categoryMatches,
       dateCandidates,
       deadline: bestDate ? bestDate.date.toISOString() : null,
       deadlineRaw: bestDate ? bestDate.raw : null,
       deadlineDaysFromNow: bestDate ? bestDate.daysFromNow : null,
-      urgency,
-
-      // Meta
-      body: emailData.body || '',  // Pass through for scorer's newsletter detection
-      parsedAt: new Date().toISOString(),
+      urgency: detectUrgency(fullText),
     };
-
-    return result;
   }
 
   return { parse };

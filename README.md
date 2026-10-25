@@ -19,7 +19,7 @@ Deadline OS is a Chrome extension that automatically scans your Gmail inbox, int
 - [Features](#features)
 - [Architecture](#architecture)
 - [Getting Started](#getting-started)
-- [Configuration](#configuration)
+- [Tuning](#tuning)
 - [Development Notes](#development-notes)
 - [Roadmap](#roadmap)
 - [Tech Stack](#tech-stack)
@@ -35,7 +35,8 @@ Deadline OS is a Chrome extension that automatically scans your Gmail inbox, int
 
 - **Background polling** every 30 minutes via the Gmail API — keeps your deadlines fresh without any manual effort
 - **DOM-based real-time detection** triggers the moment you open an email in Gmail
-- Processes up to **50 inbox messages per scan** with automatic rate-limiting
+- A **targeted Gmail search** fetches only recent (last 7 days), deadline-related mail — up to **30 messages per scan** with rate-limiting
+- A **quick pre-filter** skips marketing senders and junk subjects before any parsing happens
 
 ### Intelligent Deadline Detection
 
@@ -49,10 +50,10 @@ A **confidence scoring engine (0.0 → 1.0)** then weighs multiple signals to de
 | Score Range | Action | Behavior |
 |---|---|---|
 | ≥ 0.72 | `auto_save` | Saved immediately and synced to calendar |
-| 0.55 – 0.71 | `confirm` | Presented with a ⚠️ confirmation prompt |
-| < 0.55 | `ignore` | Silently discarded |
+| 0.60 – 0.71 | `confirm` | Shown under **Needs Review** for you to confirm |
+| < 0.60 | `ignore` | Silently discarded |
 
-Signals factored into the score include category keyword strength, date evidence, urgency level, sender domain trust, subject-line quality, and newsletter/spam penalties.
+Signals factored into the score include category keyword strength, date evidence, urgency level, sender domain trust, subject-line quality, newsletter/spam penalties, and placement-specific boosts.
 
 ### Deadline Categories
 
@@ -99,7 +100,7 @@ A clean dark-mode popup (380px wide) shows all tracked deadlines bucketed by tim
 
 - **Overdue** (red) · **Today** (amber) · **This Week** (blue) · **Later** (grey) · **No Date**
 
-Each deadline card includes the email subject, sender, category badge, days remaining, and actions: Open Email, Mark Done, Snooze, and Add to Calendar.
+Each deadline card includes the email subject, sender, category badge, days remaining, and actions: Open Email, Mark Done, Snooze, and Add to Calendar. Low-confidence deadlines appear in a separate **Needs Review** section, and the footer shows how many deadlines are tracked, done this week, and upcoming.
 
 ---
 
@@ -109,28 +110,33 @@ Each deadline card includes the email subject, sender, category badge, days rema
 deadline-os/
 ├── manifest.json                  # MV3 manifest — permissions, OAuth2, scripts
 │
-├── background/
-│   ├── service-worker.js          # Main orchestrator: alarms, message routing, pipeline
-│   ├── parser.js                  # NLP parser — extracts deadlines from email text
-│   ├── scorer.js                  # Confidence scorer — 0.0 to 1.0, action decision
-│   ├── gmail-scanner.js           # Gmail API bulk inbox scanner
-│   ├── calendar.js                # Google Calendar API integration
-│   ├── notifier.js                # Chrome notifications & alarm-based reminders
+├── background/                    # Service worker and its modules
+│   ├── service-worker.js          # Entry point: loads modules, alarms, message routing
+│   ├── email-pipeline.js          # The flow every email goes through (dedupe → parse → score → save)
+│   ├── gmail-scanner.js           # Gmail API inbox scanner
+│   ├── parser.js                  # Rule-based parser — category, dates, urgency
+│   ├── scorer.js                  # Confidence score (0.0 – 1.0) and action decision
 │   ├── deduplicator.js            # Fingerprinting to prevent duplicate saves
-│   └── storage.js                 # Abstraction over chrome.storage.local
+│   ├── storage.js                 # Deadline reads/writes over chrome.storage.local
+│   ├── notifier.js                # Alarm-based reminders and notifications
+│   ├── auth.js                    # Google sign-in and authorized API requests
+│   ├── calendar.js                # Google Calendar event creation
+│   └── calendar-sync.js           # Syncs deadlines to Calendar, with a retry queue
 │
-├── content/
-│   ├── email-extractor.js         # Extracts email data from open Gmail DOM
-│   ├── gmail-observer.js          # Watches for new emails opened in Gmail
-│   └── badge-injector.js          # Injects deadline badges on inbox rows
+├── content/                       # Scripts that run inside Gmail
+│   ├── email-extractor.js         # Reads the open email from the Gmail page
+│   ├── gmail-observer.js          # Detects when an email is opened
+│   └── badge-injector.js          # Adds deadline badges to inbox rows
 │
-├── popup/
-│   ├── popup.html                 # Extension popup UI (dark-mode dashboard)
-│   ├── popup.css                  # Popup styles
-│   └── popup.js                   # Popup logic — renders cards, actions, stats
+├── popup/                         # Toolbar popup dashboard
+│   ├── popup.html
+│   ├── popup.css
+│   └── popup.js
 │
-├── utils/
-│   └── date-utils.js              # Date parsing, normalization, relative date utilities
+├── utils/                         # Code shared across the extension
+│   ├── categories.js              # Category → emoji map
+│   ├── date-utils.js              # Date text → Date parsing
+│   └── sender-domains.js          # Trusted, marketing and blocked sender domains
 │
 └── assets/
     └── icons/                     # SVG icons (16px, 48px, 128px)
@@ -141,11 +147,17 @@ deadline-os/
 ```
 Gmail Inbox
      │
-     ├── DOM path (when email is opened)
-     │       content/email-extractor.js  →  MESSAGE: EMAIL_OPENED
+     ├── DOM path (when an email is opened)
+     │       content/gmail-observer.js + email-extractor.js  →  message: EMAIL_OPENED
      │
      └── API path (background scan every 30 min)
-             background/gmail-scanner.js
+             background/gmail-scanner.js  (search query + pre-filter)
+                       │
+                       ▼
+            background/email-pipeline.js
+                       │
+                       ▼
+            background/deduplicator.js  ← Fingerprints email, skips duplicates
                        │
                        ▼
             background/parser.js        ← Extracts category, dates, urgency
@@ -154,14 +166,11 @@ Gmail Inbox
             background/scorer.js        ← Assigns confidence score & action
                        │
                        ▼
-            background/deduplicator.js  ← Fingerprints email, skips duplicates
-                       │
-                       ▼
             background/storage.js       ← Persists to chrome.storage.local
                        │
             ┌──────────┴──────────┐
             ▼                     ▼
-   background/notifier.js   background/calendar.js
+   background/notifier.js   background/calendar-sync.js
    (schedule alarms)        (create calendar event)
 ```
 
@@ -202,17 +211,18 @@ Gmail Inbox
 
 ---
 
-## Configuration
+## Tuning
 
-Default settings are defined in `background/storage.js` and can be adjusted to your preference:
+All tunable values are constants at the top of their module:
 
-| Setting | Default | Description |
+| What | Where | Default |
 |---|---|---|
-| `autoSaveThreshold` | `0.72` | Minimum score for automatic deadline saving |
-| `confirmThreshold` | `0.55` | Minimum score to prompt for user confirmation |
-| `notifyMinutesBefore` | `[1440, 60, 15]` | Reminder times: 24 hr, 1 hr, and 15 min before deadline |
-| `calendarEnabled` | `false` | Whether to auto-sync deadlines to Google Calendar |
-| `calendarId` | `'primary'` | Target calendar for event creation |
+| Score thresholds (`auto_save` / `confirm`) | `ACTION_THRESHOLDS` in `background/scorer.js` | `0.72` / `0.60` |
+| Signal weights | `WEIGHTS` in `background/scorer.js` | see below |
+| Reminder times | `REMINDER_MINUTES` in `background/notifier.js` | `[1440, 60, 15]` |
+| Scan size and search keywords | `MAX_RESULTS`, `SEARCH_KEYWORDS` in `background/gmail-scanner.js` | `30` |
+| Polling / cleanup / retry intervals | `setupAlarms()` in `background/service-worker.js` | 30 min / 1 day / 10 min |
+| Trusted, marketing and blocked senders | `utils/sender-domains.js` | — |
 
 ---
 
@@ -224,36 +234,41 @@ The confidence scorer (`background/scorer.js`) uses a weighted signal system:
 
 | Signal | Weight |
 |---|---|
-| Strong category keyword match | +2.5 |
+| Strong category keyword match | +3.0 |
+| Haveloc email | +2.5 |
+| College domain sender | +2.3 |
 | Future date found | +2.0 |
-| College domain sender | +2.3 (compound) |
+| Career platform sender | +1.85 |
 | Deadline keyword in subject | +1.5 |
+| Placement signal in subject | +1.5 |
 | Urgency: CRITICAL | +1.5 |
-| No date found | −2.0 |
-| Marketing domain | −2.5 |
-| Newsletter penalty (unsubscribe link) | −3.0 |
+| Automated / no-reply sender | −1.5 |
+| No date found | −2.5 |
+| Engagement bait | −2.5 |
+| Promotional subject | −3.0 |
+| Marketing domain | −3.5 |
+| Newsletter penalty (unsubscribe link) | −4.0 |
+
+The raw total is divided by 11 and clamped to 0 – 1.
 
 ### Debugging
 
-Open the service worker's DevTools console via `chrome://extensions/` → "service worker" to see detailed logs:
+Open the service worker's DevTools console via `chrome://extensions/` → "service worker". Every processed email is logged with its category, score, action, and the signals that produced the score:
 
 ```
-[DeadlineOS SW] Subject : Interview Confirmation - SRM IST
-[DeadlineOS SW] Category: INTERVIEW
-[DeadlineOS SW] Score   : 0.834 → AUTO_SAVE
-[DeadlineOS SW] Deadline: April 10, 2026
+[Pipeline] "Interview Confirmation - SRM IST" → INTERVIEW (0.834) → auto_save ['Strong category match: INTERVIEW (interview)', ...]
 ```
 
-**Dump full storage state:**
+**Dump full storage state** (in the service worker console):
 
 ```js
-chrome.runtime.sendMessage({ type: 'DEBUG_DUMP' }, console.log)
+chrome.storage.local.get(null, console.log)
 ```
 
-**Clear all stored deadlines:**
+**Clear all stored data:**
 
 ```js
-chrome.runtime.sendMessage({ type: 'CLEAR_ALL' }, console.log)
+chrome.storage.local.clear()
 ```
 
 ---

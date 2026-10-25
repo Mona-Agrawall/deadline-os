@@ -1,40 +1,65 @@
 // popup/popup.js
-// Renders saved deadlines from chrome.storage into the dashboard UI.
-// Includes Google Calendar sync, scan controls, snooze, confirm section, and stats.
+// Renders the deadline dashboard and handles its buttons.
+// All data comes from the service worker via chrome.runtime messages.
 
 const content = document.getElementById('content');
+const scanBtn = document.getElementById('scanBtn');
 const scanStatusText = document.getElementById('scanStatusText');
 const scanNewCount = document.getElementById('scanNewCount');
-const scanBtn = document.getElementById('scanBtn');
+const authBanner = document.getElementById('authBanner');
+const authStatus = document.getElementById('authStatus');
+const connectBtn = document.getElementById('connectCalBtn');
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SNOOZE_HOURS = 24;
+
+const SECTIONS = [
+  { key: 'overdue', title: 'Overdue', dot: 'dot-overdue' },
+  { key: 'today', title: 'Today', dot: 'dot-today' },
+  { key: 'thisWeek', title: 'This week', dot: 'dot-week' },
+  { key: 'later', title: 'Later', dot: 'dot-later' },
+  { key: 'noDate', title: 'No date found', dot: 'dot-nodate' },
+];
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-function formatDate(isoString) {
+// Resolves with the service worker's response, or null if it failed
+function sendMessage(message) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(message, (response) => {
+      resolve(chrome.runtime.lastError ? null : response);
+    });
+  });
+}
+
+function escapeHtml(str) {
+  return (str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function stateMessage(emoji, html) {
+  return `<div class="state-msg"><div class="emoji">${emoji}</div>${html}</div>`;
+}
+
+// → { text, cls, days } describing how far away the deadline is
+function describeDueDate(isoString) {
   if (!isoString) return null;
 
   const date = new Date(isoString);
-  const now = new Date();
-  const diffDays = Math.ceil((date - now) / (1000 * 60 * 60 * 24));
+  const days = Math.ceil((date - new Date()) / DAY_MS);
 
-  if (diffDays < 0) {
-    const ago = Math.abs(diffDays);
-    return { text: ago === 1 ? '1 day overdue' : `${ago} days overdue`, cls: 'overdue', days: diffDays };
-  }
-  if (diffDays === 0) return { text: 'Due today', cls: 'soon', days: 0 };
-  if (diffDays === 1) return { text: 'Due tomorrow', cls: 'soon', days: 1 };
-  if (diffDays <= 7) return { text: `In ${diffDays} days`, cls: '', days: diffDays };
-
-  return {
-    text: date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }),
-    cls: '',
-    days: diffDays,
-  };
+  if (days < 0) return { text: days === -1 ? '1 day overdue' : `${-days} days overdue`, cls: 'overdue', days };
+  if (days === 0) return { text: 'Due today', cls: 'soon', days };
+  if (days === 1) return { text: 'Due tomorrow', cls: 'soon', days };
+  if (days <= 7) return { text: `In ${days} days`, cls: '', days };
+  return { text: date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }), cls: '', days };
 }
 
 function formatTimeAgo(isoString) {
-  if (!isoString) return 'Never scanned';
-  const diff = Date.now() - new Date(isoString).getTime();
-  const minutes = Math.floor(diff / 60000);
+  const minutes = Math.floor((Date.now() - new Date(isoString).getTime()) / 60000);
   if (minutes < 1) return 'Just now';
   if (minutes < 60) return `${minutes} min ago`;
   const hours = Math.floor(minutes / 60);
@@ -42,429 +67,278 @@ function formatTimeAgo(isoString) {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function escapeHtml(str) {
-  return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
 function getAccountLabel(email) {
-  if (!email) return '';
-  if (email.includes('srmist.edu.in') || email.includes('srm.edu.in')) return 'SRM';
-  if (email.includes('gmail.com')) return 'Personal';
+  const domain = (email || '').split('@')[1];
+  if (SenderDomains.matches(domain, SenderDomains.COLLEGE)) return 'SRM';
+  if (domain === 'gmail.com') return 'Personal';
   return '';
 }
 
-// ── Card builder ───────────────────────────────────────────────────
+// ── Card ───────────────────────────────────────────────────────────
 
-function buildCard(deadline, isConfirmSection) {
-  const dateInfo = formatDate(deadline.deadline);
-  const cat = deadline.category || 'UNKNOWN';
+function buildDaysCounter(due) {
+  if (!due) return '';
 
-  const dateHtml = dateInfo
-    ? `<span class="card-date ${dateInfo.cls}">${escapeHtml(dateInfo.text)}</span>`
+  let cls = 'later';
+  let title = `${due.days} day${due.days === 1 ? '' : 's'} left`;
+  if (due.days < 0) { cls = 'overdue'; title = 'Overdue'; }
+  else if (due.days === 0) { cls = 'today'; title = 'Due today'; }
+  else if (due.days <= 7) cls = 'week';
+
+  const value = due.days === 0 ? '!' : Math.abs(due.days);
+  return `<div class="card-days ${cls}" title="${title}">${value}</div>`;
+}
+
+function buildCard(deadline, needsReview) {
+  const due = describeDueDate(deadline.deadline);
+  const category = deadline.category || 'UNKNOWN';
+  const accountLabel = getAccountLabel(deadline.senderEmail);
+  const id = escapeHtml(deadline.id);
+
+  const dateHtml = due
+    ? `<span class="card-date ${due.cls}">${escapeHtml(due.text)}</span>`
     : `<span class="card-date">${escapeHtml(deadline.deadlineRaw || 'No date found')}</span>`;
 
-  const senderHtml = deadline.senderName
-    ? `<span class="card-sender">${escapeHtml(deadline.senderName)}</span>`
-    : '';
+  const calendarButton = deadline.calendarEventId
+    ? `<a href="${escapeHtml(deadline.calendarLink || '#')}" target="_blank" class="btn btn-cal-done" title="Open in Google Calendar">📅 In Calendar</a>`
+    : `<button class="btn btn-cal" data-id="${id}" data-action="sync" title="Add to Google Calendar">📅 Add to Cal</button>`;
 
-  // Account label
-  const accountLabel = getAccountLabel(deadline.senderEmail);
-  const accountHtml = accountLabel
-    ? `<span class="card-account">${escapeHtml(accountLabel)}</span>`
-    : '';
+  const statusButtons = needsReview
+    ? `<button class="btn btn-confirm" data-id="${id}" data-action="confirm">✓ Yes, track this</button>
+       <button class="btn btn-reject" data-id="${id}" data-action="dismiss">✗ Not a deadline</button>`
+    : `<button class="btn btn-done" data-id="${id}" data-action="done">✓ Done</button>`;
 
-  // Calendar status
-  const calStatusHtml = deadline.calendarEventId
-    ? `<span class="card-cal-status">📅 ✓</span>`
-    : '';
-
-  // Calendar button
-  const calBtn = deadline.calendarEventId
-    ? `<a href="${escapeHtml(deadline.calendarLink || '#')}"
-          target="_blank"
-          class="btn btn-cal-done"
-          title="Open in Google Calendar">
-          📅 In Calendar
-       </a>`
-    : `<button class="btn btn-cal"
-          data-id="${deadline.id}"
-          data-action="sync"
-          title="Add to Google Calendar">
-          📅 Add to Cal
-       </button>`;
-
-  // Confirm/reject buttons for the confirm section
-  const confirmBtns = isConfirmSection
-    ? `<button class="btn btn-confirm" data-id="${deadline.id}" data-action="confirm">✓ Yes, track this</button>
-       <button class="btn btn-reject" data-id="${deadline.id}" data-action="dismiss">✗ Not a deadline</button>`
-    : '';
-
-  // Snooze button (for non-confirm cards)
-  const snoozeBtn = !isConfirmSection
-    ? `<button class="btn btn-snooze" data-id="${deadline.id}" data-action="snooze" title="Snooze for 24 hours">💤 Snooze</button>`
-    : '';
-
-  // Days remaining badge (prominent)
-  let daysHtml = '';
-  if (dateInfo && dateInfo.days !== undefined) {
-    let daysCls = 'later';
-    if (dateInfo.days < 0) daysCls = 'overdue';
-    else if (dateInfo.days === 0) daysCls = 'today';
-    else if (dateInfo.days <= 7) daysCls = 'week';
-
-    const daysText = dateInfo.days < 0
-      ? Math.abs(dateInfo.days)
-      : dateInfo.days;
-    const daysLabel = dateInfo.days < 0 ? 'overdue' : (dateInfo.days === 0 ? 'today' : `day${dateInfo.days !== 1 ? 's' : ''}`);
-    daysHtml = `<div class="card-days ${daysCls}" title="${dateInfo.days < 0 ? 'Overdue' : daysText + ' ' + daysLabel}">${daysText === 0 ? '!' : daysText}</div>`;
-  }
+  const snoozeButton = needsReview
+    ? ''
+    : `<button class="btn btn-snooze" data-id="${id}" data-action="snooze" title="Snooze for ${SNOOZE_HOURS} hours">💤 Snooze</button>`;
 
   return `
-    <div class="card ${isConfirmSection ? 'card-confirm' : ''}" data-id="${deadline.id}">
+    <div class="card ${needsReview ? 'card-confirm' : ''}">
       <div class="card-top">
         <div class="card-subject">${escapeHtml(deadline.subject)}</div>
-        ${daysHtml}
-        <button class="card-dismiss" data-id="${deadline.id}" data-action="dismiss" title="Dismiss">×</button>
+        ${buildDaysCounter(due)}
+        <button class="card-dismiss" data-id="${id}" data-action="dismiss" title="Dismiss">×</button>
       </div>
       <div class="card-meta">
-        <span class="badge badge-${cat}">${cat}</span>
+        <span class="badge badge-${escapeHtml(category)}">${escapeHtml(category)}</span>
         ${dateHtml}
-        ${senderHtml}
-        ${accountHtml}
-        ${calStatusHtml}
+        ${deadline.senderName ? `<span class="card-sender">${escapeHtml(deadline.senderName)}</span>` : ''}
+        ${accountLabel ? `<span class="card-account">${accountLabel}</span>` : ''}
+        ${deadline.calendarEventId ? '<span class="card-cal-status">📅 ✓</span>' : ''}
       </div>
       <div class="card-actions">
         <button class="btn btn-open" data-url="${escapeHtml(deadline.emailUrl)}">Open email</button>
-        ${isConfirmSection ? confirmBtns : `<button class="btn btn-done" data-id="${deadline.id}" data-action="done">✓ Done</button>`}
-        ${calBtn}
-        ${snoozeBtn}
+        ${statusButtons}
+        ${calendarButton}
+        ${snoozeButton}
       </div>
     </div>
   `;
 }
 
-// ── Section builder ────────────────────────────────────────────────
+function buildSection(title, dotClass, deadlines, needsReview = false) {
+  if (deadlines.length === 0) return '';
 
-function buildSection(title, dotClass, items, isConfirmSection = false) {
-  if (items.length === 0) return '';
-
-  const cards = items.map(d => buildCard(d, isConfirmSection)).join('');
   return `
     <div class="section">
       <div class="section-header">
         <span class="dot ${dotClass}"></span>
         ${title}
-        <span class="section-count">${items.length}</span>
+        <span class="section-count">${deadlines.length}</span>
       </div>
-      ${cards}
+      ${deadlines.map(d => buildCard(d, needsReview)).join('')}
     </div>
   `;
 }
 
-// ── Main render ────────────────────────────────────────────────────
+// ── Rendering ──────────────────────────────────────────────────────
 
-function render() {
-  content.innerHTML = `<div class="state-msg"><div class="emoji">⏳</div>Loading...</div>`;
+async function render() {
+  content.innerHTML = stateMessage('⏳', 'Loading...');
 
-  chrome.runtime.sendMessage({ type: 'GET_DEADLINES' }, (buckets) => {
-    if (chrome.runtime.lastError || !buckets) {
-      content.innerHTML = `
-        <div class="state-msg">
-          <div class="emoji">⚠️</div>
-          Could not load deadlines.<br>Try refreshing.
-        </div>`;
-      return;
-    }
+  const buckets = await sendMessage({ type: 'GET_DEADLINES' });
+  if (!buckets) {
+    content.innerHTML = stateMessage('⚠️', 'Could not load deadlines.<br>Try refreshing.');
+    return;
+  }
 
-    // Filter out snoozed deadlines from all buckets
-    const now = new Date().toISOString();
-    for (const key of Object.keys(buckets)) {
-      buckets[key] = buckets[key].filter(d => {
-        if (d.snoozedUntil && d.snoozedUntil > now) return false;
-        return true;
-      });
-    }
+  // Snoozed deadlines are hidden; low-confidence ones go to "Needs Review"
+  const now = new Date().toISOString();
+  const isVisible = d => !(d.snoozedUntil && d.snoozedUntil > now);
+  const needsReview = d => d.status === 'confirm';
 
-    // Separate "confirm" status items into their own section
-    const confirmItems = [];
-    for (const key of Object.keys(buckets)) {
-      buckets[key] = buckets[key].filter(d => {
-        if (d.status === 'confirm') {
-          confirmItems.push(d);
-          return false;
-        }
-        return true;
-      });
-    }
+  const reviewItems = Object.values(buckets).flat().filter(d => isVisible(d) && needsReview(d));
+  const sectionsHtml = SECTIONS
+    .map(s => buildSection(s.title, s.dot, buckets[s.key].filter(d => isVisible(d) && !needsReview(d))))
+    .join('');
 
-    const allItems = Object.values(buckets).flat();
-    const total = allItems.length + confirmItems.length;
+  content.innerHTML = (sectionsHtml + buildSection('Needs Review', 'dot-confirm', reviewItems, true)) ||
+    stateMessage('✅', 'No deadlines found yet.<br><span class="hint">Open emails in Gmail or click Scan to start tracking.</span>');
 
-    if (total === 0) {
-      content.innerHTML = `
-        <div class="state-msg">
-          <div class="emoji">✅</div>
-          No deadlines found yet.<br>
-          <span style="color:#444">Open emails in Gmail or click Scan to start tracking.</span>
-        </div>`;
-      updateStats();
-      return;
-    }
-
-    content.innerHTML =
-      buildSection('Overdue', 'dot-overdue', buckets.overdue || []) +
-      buildSection('Today', 'dot-today', buckets.today || []) +
-      buildSection('This week', 'dot-week', buckets.thisWeek || []) +
-      buildSection('Later', 'dot-later', buckets.later || []) +
-      buildSection('No date found', 'dot-nodate', buckets.noDate || []) +
-      buildSection('Needs Review', 'dot-confirm', confirmItems, true);
-
-    updateStats();
-  });
+  updateStats();
 }
 
-// ── Scan status ────────────────────────────────────────────────────
+async function updateStats() {
+  const stats = await sendMessage({ type: 'GET_STATS' });
+  if (!stats) return;
 
-function updateScanStatus() {
-  chrome.runtime.sendMessage({ type: 'GET_SCAN_STATUS' }, (status) => {
-    if (chrome.runtime.lastError || !status) {
-      scanStatusText.textContent = 'Scan status unavailable';
-      return;
-    }
-
-    if (status.lastScanTime) {
-      scanStatusText.textContent = `Last scanned: ${formatTimeAgo(status.lastScanTime)}`;
-    } else {
-      scanStatusText.textContent = 'Not yet scanned';
-    }
-
-    if (status.lastScanResults?.newDeadlines > 0) {
-      scanNewCount.textContent = `+${status.lastScanResults.newDeadlines} new`;
-      scanNewCount.style.display = 'inline';
-    } else {
-      scanNewCount.style.display = 'none';
-    }
-  });
+  document.getElementById('statTotal').textContent = stats.total;
+  document.getElementById('statCompleted').textContent = stats.completedThisWeek;
+  document.getElementById('statUpcoming').textContent = stats.upcomingThisWeek;
 }
 
-// ── Stats footer ───────────────────────────────────────────────────
-
-function updateStats() {
-  chrome.runtime.sendMessage({ type: 'GET_DEADLINES' }, (buckets) => {
-    if (chrome.runtime.lastError || !buckets) return;
-
-    const all = Object.values(buckets).flat();
-    const total = all.length;
-    const done = all.filter(d => d.status === 'done').length;
-
-    // Count upcoming this week
-    const weekEnd = new Date();
-    weekEnd.setDate(weekEnd.getDate() + 7);
-    const upcoming = all.filter(d => {
-      if (!d.deadline) return false;
-      const dl = new Date(d.deadline);
-      return dl >= new Date() && dl < weekEnd && d.status !== 'done' && d.status !== 'dismissed';
-    }).length;
-
-    document.getElementById('statTotal').textContent = total;
-    document.getElementById('statCompleted').textContent = done;
-    document.getElementById('statUpcoming').textContent = upcoming;
-  });
+function showNewCount(count) {
+  scanNewCount.textContent = `+${count} new`;
+  scanNewCount.hidden = !(count > 0);
 }
 
-// ── Calendar auth ──────────────────────────────────────────────────
+async function updateScanStatus() {
+  const status = await sendMessage({ type: 'GET_SCAN_STATUS' });
+  if (!status) {
+    scanStatusText.textContent = 'Scan status unavailable';
+    return;
+  }
 
-function checkCalendarAuth() {
-  chrome.runtime.sendMessage({ type: 'CHECK_AUTH' }, (response) => {
-    if (chrome.runtime.lastError) return;
-
-    const banner = document.getElementById('authBanner');
-    const status = document.getElementById('authStatus');
-
-    if (response?.authenticated) {
-      if (banner) banner.style.display = 'none';
-      if (status) {
-        status.textContent = '✓ Calendar connected';
-        status.style.color = '#4ade80';
-      }
-    } else {
-      if (banner) banner.style.display = 'flex';
-      if (status) {
-        status.textContent = 'Gmail deadline tracker';
-        status.style.color = '';
-      }
-    }
-  });
+  scanStatusText.textContent = status.lastScanTime
+    ? `Last scanned: ${formatTimeAgo(status.lastScanTime)}`
+    : 'Not yet scanned';
+  showNewCount(status.lastScanResults?.newDeadlines || 0);
 }
 
-function syncAllPending() {
-  chrome.storage.local.get('deadlines', (data) => {
-    const deadlines = data.deadlines || [];
-    const pending = deadlines.filter(d =>
-      (d.status === 'pending' || d.status === 'synced') && !d.calendarEventId
-    );
+async function updateAuthState() {
+  const response = await sendMessage({ type: 'CHECK_AUTH' });
+  if (!response) return;
 
-    if (pending.length === 0) return;
-    console.log('[Popup] Syncing', pending.length, 'deadlines to calendar...');
-
-    pending.forEach(d => {
-      chrome.runtime.sendMessage(
-        { type: 'SYNC_TO_CALENDAR', deadlineId: d.id },
-        () => render()
-      );
-    });
-  });
+  const connected = response.authenticated;
+  authBanner.hidden = connected;
+  authStatus.textContent = connected ? '✓ Calendar connected' : 'Gmail deadline tracker';
+  authStatus.classList.toggle('connected', connected);
 }
 
-// ── Scan Now button ────────────────────────────────────────────────
+// ── Calendar ───────────────────────────────────────────────────────
 
-scanBtn.addEventListener('click', () => {
+// After connecting, add every saved deadline that isn't in the calendar yet.
+// Runs one at a time because each sync rewrites the stored deadline list.
+async function syncAllPending() {
+  const deadlines = await sendMessage({ type: 'GET_ALL_DEADLINES' }) || [];
+  const pending = deadlines.filter(d =>
+    (d.status === 'pending' || d.status === 'synced') && !d.calendarEventId
+  );
+  if (pending.length === 0) return;
+
+  for (const d of pending) {
+    await sendMessage({ type: 'SYNC_TO_CALENDAR', deadlineId: d.id });
+  }
+  render();
+}
+
+async function syncToCalendar(button, deadlineId) {
+  button.textContent = 'Syncing...';
+  button.disabled = true;
+
+  const result = await sendMessage({ type: 'SYNC_TO_CALENDAR', deadlineId });
+  if (result?.created || result?.reason === 'already_exists') {
+    render();
+    return;
+  }
+
+  button.textContent = '📅 Add to Cal';
+  button.disabled = false;
+  if (result?.reason === 'not_authenticated' || result?.error?.includes('Not authenticated')) {
+    alert('Please connect your Google Calendar first using the banner above.');
+  }
+}
+
+// ── Event listeners ────────────────────────────────────────────────
+
+scanBtn.addEventListener('click', async () => {
   scanBtn.disabled = true;
   scanBtn.textContent = '⏳ Scanning...';
   scanStatusText.innerHTML = '<span class="scan-spinner"></span> Scanning inbox...';
 
-  chrome.runtime.sendMessage({ type: 'SCAN_INBOX' }, (result) => {
-    scanBtn.disabled = false;
-    scanBtn.textContent = '🔍 Scan';
+  const result = await sendMessage({ type: 'SCAN_INBOX' });
+  scanBtn.disabled = false;
+  scanBtn.textContent = '🔍 Scan';
 
-    if (chrome.runtime.lastError || !result) {
-      scanStatusText.textContent = 'Scan failed';
-      return;
-    }
-
-    if (result.error === 'not_authenticated') {
-      scanStatusText.textContent = 'Connect your account first ↓';
-      return;
-    }
-
-    scanStatusText.textContent = `Scanned ${result.scanned} emails`;
-    if (result.newDeadlines > 0) {
-      scanNewCount.textContent = `+${result.newDeadlines} new`;
-      scanNewCount.style.display = 'inline';
-    }
-
-    render();
-    setTimeout(updateScanStatus, 2000);
-  });
-});
-
-// Connect button click
-const connectBtn = document.getElementById('connectCalBtn');
-if (connectBtn) {
-  connectBtn.addEventListener('click', () => {
-    connectBtn.textContent = 'Connecting...';
-    connectBtn.disabled = true;
-
-    chrome.runtime.sendMessage({ type: 'AUTHENTICATE_CALENDAR' }, (response) => {
-      if (chrome.runtime.lastError) {
-        connectBtn.textContent = 'Connect';
-        connectBtn.disabled = false;
-        return;
-      }
-
-      if (response?.success) {
-        checkCalendarAuth();
-        syncAllPending();
-      } else {
-        connectBtn.textContent = 'Connect';
-        connectBtn.disabled = false;
-        alert('Calendar connection failed.\n\n' + (response?.error || 'Unknown error'));
-      }
-    });
-  });
-}
-
-// ── Event delegation ───────────────────────────────────────────────
-
-content.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-action], [data-url]');
-  if (!btn) return;
-
-  // Open email in new tab
-  if (btn.dataset.url) {
-    chrome.tabs.create({ url: btn.dataset.url });
+  if (!result) {
+    scanStatusText.textContent = 'Scan failed';
+    return;
+  }
+  if (result.error === 'not_authenticated') {
+    scanStatusText.textContent = 'Connect your account first ↓';
     return;
   }
 
-  const { action, id } = btn.dataset;
+  scanStatusText.textContent = `Scanned ${result.scanned} emails`;
+  if (result.newDeadlines > 0) showNewCount(result.newDeadlines);
+  render();
+  setTimeout(updateScanStatus, 2000);
+});
+
+connectBtn.addEventListener('click', async () => {
+  connectBtn.textContent = 'Connecting...';
+  connectBtn.disabled = true;
+
+  const response = await sendMessage({ type: 'AUTHENTICATE' });
+  if (response?.success) {
+    updateAuthState();
+    syncAllPending();
+    return;
+  }
+
+  connectBtn.textContent = 'Connect';
+  connectBtn.disabled = false;
+  if (response) alert('Calendar connection failed.\n\n' + (response.error || 'Unknown error'));
+});
+
+// Card buttons (event delegation — cards are re-rendered often)
+content.addEventListener('click', async (e) => {
+  const button = e.target.closest('[data-action], [data-url]');
+  if (!button) return;
+
+  if (button.dataset.url) {
+    chrome.tabs.create({ url: button.dataset.url });
+    return;
+  }
+
+  const { action, id } = button.dataset;
   if (!action || !id) return;
 
-  // Mark done or dismiss
-  if (action === 'done' || action === 'dismiss') {
-    chrome.runtime.sendMessage(
-      { type: 'UPDATE_STATUS', id, status: action === 'done' ? 'done' : 'dismissed' },
-      () => render()
-    );
-    return;
+  switch (action) {
+    case 'done':
+      await sendMessage({ type: 'UPDATE_STATUS', id, status: 'done' });
+      break;
+    case 'dismiss':
+      await sendMessage({ type: 'UPDATE_STATUS', id, status: 'dismissed' });
+      break;
+    case 'confirm': // "Needs Review" → tracked
+      await sendMessage({ type: 'UPDATE_STATUS', id, status: 'pending' });
+      break;
+    case 'snooze':
+      await sendMessage({ type: 'SNOOZE_DEADLINE', id, hours: SNOOZE_HOURS });
+      break;
+    case 'sync':
+      syncToCalendar(button, id);
+      return;
+    default:
+      return;
   }
-
-  // Confirm a low-confidence deadline (move from confirm → pending)
-  if (action === 'confirm') {
-    chrome.runtime.sendMessage(
-      { type: 'UPDATE_STATUS', id, status: 'pending' },
-      () => render()
-    );
-    return;
-  }
-
-  // Snooze for 24 hours
-  if (action === 'snooze') {
-    chrome.runtime.sendMessage(
-      { type: 'SNOOZE_DEADLINE', id, hours: 24 },
-      () => render()
-    );
-    return;
-  }
-
-  // Sync individual deadline to Google Calendar
-  if (action === 'sync') {
-    btn.textContent = 'Syncing...';
-    btn.disabled = true;
-
-    chrome.runtime.sendMessage(
-      { type: 'SYNC_TO_CALENDAR', deadlineId: id },
-      (result) => {
-        if (chrome.runtime.lastError) {
-          btn.textContent = '📅 Add to Cal';
-          btn.disabled = false;
-          return;
-        }
-
-        if (result?.created) {
-          render();
-        } else if (result?.reason === 'already_exists') {
-          render();
-        } else {
-          btn.textContent = '📅 Add to Cal';
-          btn.disabled = false;
-
-          if (result?.error?.includes('Not authenticated') ||
-              result?.reason === 'not_authenticated') {
-            alert('Please connect your Google Calendar first using the banner above.');
-          } else {
-            console.warn('[Popup] Sync failed:', result);
-          }
-        }
-      }
-    );
-    return;
-  }
+  render();
 });
-
-// ── Toolbar controls ───────────────────────────────────────────────
 
 document.getElementById('refreshBtn').addEventListener('click', () => {
   render();
   updateScanStatus();
 });
 
-document.getElementById('clearBtn').addEventListener('click', () => {
-  if (confirm('Clear all tracked deadlines? This cannot be undone.')) {
-    chrome.runtime.sendMessage({ type: 'CLEAR_ALL' }, () => render());
-  }
+document.getElementById('clearBtn').addEventListener('click', async () => {
+  if (!confirm('Clear all tracked deadlines? This cannot be undone.')) return;
+  await sendMessage({ type: 'CLEAR_ALL' });
+  render();
 });
 
 // ── Init ───────────────────────────────────────────────────────────
+
 render();
-checkCalendarAuth();
+updateAuthState();
 updateScanStatus();

@@ -27,6 +27,7 @@
     {
       "matches": ["https://mail.google.com/*"],
       "js": [
+        "utils/categories.js",
         "content/email-extractor.js",
         "content/gmail-observer.js",
         "content/badge-injector.js"

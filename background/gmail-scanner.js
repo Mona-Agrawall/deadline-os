@@ -1,178 +1,177 @@
 // background/gmail-scanner.js
-// Uses Gmail API to fetch and process inbox emails in bulk.
-// This is the "automatic scanning" feature — no need to open emails manually.
-// Must be importScripts'd AFTER calendar.js (needs getToken).
+// Scans the inbox through the Gmail API so deadlines are found without
+// the user opening each email.
+//
+// Two filters keep the scan fast and quiet:
+//   1. A Gmail search query only returns recent, deadline-related mail.
+//   2. A quick sender/subject check skips obvious marketing before parsing.
 
 const GmailScanner = (() => {
 
   const GMAIL_API = 'https://www.googleapis.com/gmail/v1';
-  const MAX_RESULTS = 50;
-  const FETCH_DELAY_MS = 200; // Rate limiting between individual message fetches
+  const MAX_RESULTS = 30;
+  const FETCH_DELAY_MS = 150;   // pause between message fetches (rate limiting)
+  const MAX_BODY_LENGTH = 3000; // same cap as the content script
 
-  // ── Gmail API helpers ──────────────────────────────────────────────
+  // ── Gmail search query ─────────────────────────────────────────────
 
-  async function getToken() {
-    return new Promise((resolve, reject) => {
-      chrome.identity.getAuthToken({ interactive: false }, (token) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        if (!token) {
-          reject(new Error('No token returned'));
-          return;
-        }
-        resolve(token);
-      });
-    });
-  }
+  const SEARCH_KEYWORDS = [
+    // Interview & hiring
+    'interview', 'interview scheduled', 'interview confirmation',
+    'phone screen', 'hiring assessment', 'hirevue', 'codility',
+    'hackerrank', 'technical round', 'hr round', 'recruiter',
+    'shortlisted', 'selected', 'candidacy',
+    // Placement & career
+    'placement', 'placement drive', 'campus recruitment',
+    'off-campus drive', 'pre-placement offer', 'ppo',
+    'haveloc', 'internship offer', 'job offer',
+    // Deadlines & assignments
+    'deadline', 'due date', 'submission deadline', 'submit by',
+    'last date', 'assignment due', 'exam schedule',
+    'registration deadline', 'apply by', 'apply before',
+    // Academic
+    'viva', 'cia exam', 'end sem', 'mid sem', 'lab evaluation',
+    // Payment / fee
+    'fee payment', 'payment due', 'tuition due', 'hostel fee',
+    // Action required
+    'action required', 'response needed', 'urgent reminder',
+  ];
 
-  async function gmailApiCall(endpoint, token) {
-    const response = await fetch(`${GMAIL_API}${endpoint}`, {
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
+  const EXCLUDED_SENDERS = [
+    'noreply@linkedin.com', 'notifications@linkedin.com',
+    'noreply@medium.com', 'noreply@quora.com',
+    'no-reply@accounts.google.com', 'noreply@youtube.com',
+    'newsletter@', 'marketing@', 'digest@', 'updates@',
+    'noreply@github.com', 'notifications@github.com',
+  ];
 
-    if (response.status === 401) {
-      // Token expired — clear and retry once
-      await new Promise((resolve) => {
-        chrome.identity.removeCachedAuthToken({ token }, resolve);
-      });
-      const newToken = await getToken();
-      const retry = await fetch(`${GMAIL_API}${endpoint}`, {
-        headers: { 'Authorization': `Bearer ${newToken}` },
-      });
-      if (!retry.ok) {
-        const err = await retry.json().catch(() => ({}));
-        throw new Error(`Gmail API ${retry.status}: ${err?.error?.message || 'Unknown'}`);
-      }
-      return retry.json();
+  // Inbox mail from the last 7 days, outside the Promotions/Social/Forums
+  // tabs, matching any keyword ({a b c} means "a OR b OR c" in Gmail search)
+  const SEARCH_QUERY = [
+    'in:inbox',
+    'newer_than:7d',
+    '-category:promotions -category:social -category:forums',
+    EXCLUDED_SENDERS.map(s => `-from:${s}`).join(' '),
+    `{${SEARCH_KEYWORDS.join(' ')}}`,
+  ].join(' ');
+
+  // ── Quick pre-filter ───────────────────────────────────────────────
+
+  const AUTOMATED_SENDER_REGEX =
+    /^(noreply|no-reply|notifications?|newsletter|marketing|updates|digest|info|mailer|donotreply)@/i;
+  const IMPORTANT_SUBJECT_REGEX =
+    /interview|placement|deadline|submission|exam|assessment|shortlisted|selected|haveloc/i;
+
+  const JUNK_SUBJECT_PATTERNS = [
+    // Newsletter / marketing
+    /newsletter/i, /digest/i, /weekly roundup/i, /monthly update/i,
+    /what's new/i, /product update/i, /just launched/i,
+    /check out/i, /trending/i, /top picks/i, /curated/i,
+    /exclusive offer/i, /\bsale\b/i, /discount/i, /free trial/i,
+    /upgrade your/i, /premium/i, /introducing/i, /announcing/i,
+    /is now/i, /is here/i, /powered by/i, /how to/i,
+    /don't miss out/i, /best of/i, /guide to/i, /tips for/i,
+    // Social / engagement bait
+    /\d+ people viewed/i, /new connection/i, /endorsed you/i,
+    /your weekly/i, /your daily/i, /your \w+ summary/i,
+    /someone mentioned/i, /new follower/i,
+    // Transactional noise
+    /order confirmation/i, /order shipped/i, /delivery update/i,
+    /your receipt/i, /purchase confirmation/i,
+    /password reset/i, /verify your email/i, /login alert/i,
+  ];
+
+  function shouldSkipEmail(emailData) {
+    const senderEmail = (emailData.sender.email || '').toLowerCase();
+    const senderDomain = senderEmail.split('@')[1] || '';
+    const subject = emailData.subject.toLowerCase();
+
+    if (SenderDomains.isTrusted(senderDomain)) return false;
+    if (SenderDomains.matches(senderDomain, SenderDomains.BLOCKED)) return true;
+
+    // Automated senders are skipped unless the subject looks important
+    if (AUTOMATED_SENDER_REGEX.test(senderEmail) && !IMPORTANT_SUBJECT_REGEX.test(subject)) {
+      return true;
     }
 
+    return JUNK_SUBJECT_PATTERNS.some(p => p.test(subject));
+  }
+
+  // ── Gmail API ──────────────────────────────────────────────────────
+
+  async function gmailApiCall(endpoint) {
+    const response = await Auth.authorizedFetch(`${GMAIL_API}${endpoint}`);
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
       throw new Error(`Gmail API ${response.status}: ${err?.error?.message || 'Unknown'}`);
     }
-
     return response.json();
   }
 
-  // ── Base64url decode ───────────────────────────────────────────────
-  // Gmail API returns body data in base64url encoding (RFC 4648 §5)
-
+  // Gmail returns message bodies as base64url-encoded UTF-8
   function decodeBase64Url(data) {
-    if (!data) return '';
     try {
-      // Replace base64url chars with standard base64
-      const base64 = data.replace(/-/g, '+').replace(/_/g, '/');
-      return decodeURIComponent(
-        atob(base64).split('').map(c =>
-          '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)
-        ).join('')
-      );
+      const binary = atob(data.replace(/-/g, '+').replace(/_/g, '/'));
+      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
     } catch (e) {
-      console.warn('[GmailScanner] Base64 decode failed:', e.message);
+      console.warn('[GmailScanner] Could not decode body:', e.message);
       return '';
     }
   }
 
-  // ── Extract email body from Gmail API message parts ────────────────
-  // Gmail messages have a nested MIME structure — we want plain text first,
-  // falling back to HTML stripped of tags.
+  function stripHtml(html) {
+    return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
 
+  // Walks the MIME tree: plain text first, then HTML, then nested parts
   function extractBody(payload) {
-    if (!payload) return '';
+    if (payload.body?.data) return decodeBase64Url(payload.body.data);
+    if (!payload.parts) return '';
 
-    // Simple message (no parts)
-    if (payload.body?.data) {
-      return decodeBase64Url(payload.body.data);
+    const plain = payload.parts.find(p => p.mimeType === 'text/plain' && p.body?.data);
+    if (plain) return decodeBase64Url(plain.body.data);
+
+    const html = payload.parts.find(p => p.mimeType === 'text/html' && p.body?.data);
+    if (html) return stripHtml(decodeBase64Url(html.body.data));
+
+    for (const part of payload.parts) {
+      const nested = part.parts ? extractBody(part) : '';
+      if (nested) return nested;
     }
-
-    // Multipart — walk the tree looking for text/plain or text/html
-    if (payload.parts) {
-      // Prefer text/plain
-      for (const part of payload.parts) {
-        if (part.mimeType === 'text/plain' && part.body?.data) {
-          return decodeBase64Url(part.body.data);
-        }
-      }
-      // Fallback to text/html (strip tags)
-      for (const part of payload.parts) {
-        if (part.mimeType === 'text/html' && part.body?.data) {
-          const html = decodeBase64Url(part.body.data);
-          return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-        }
-      }
-      // Recurse into nested multipart (e.g., multipart/alternative inside multipart/mixed)
-      for (const part of payload.parts) {
-        if (part.parts) {
-          const nested = extractBody(part);
-          if (nested) return nested;
-        }
-      }
-    }
-
     return '';
   }
 
-  // ── Convert Gmail API message → our emailData format ───────────────
-
-  function messageToEmailData(message) {
+  // Converts a Gmail API message into the same shape the content script sends
+  function toEmailData(message) {
     const headers = message.payload?.headers || [];
+    const getHeader = (name) =>
+      headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 
-    function getHeader(name) {
-      const h = headers.find(h => h.name.toLowerCase() === name.toLowerCase());
-      return h ? h.value : null;
-    }
-
-    const subject = getHeader('Subject') || '(no subject)';
-    const from = getHeader('From') || '';
-    const date = getHeader('Date') || '';
-    const messageId = message.id;
-
-    // Parse "From: Name <email@domain.com>" format
+    // "Name <email@domain.com>" or just "email@domain.com"
+    const from = getHeader('From');
     const fromMatch = from.match(/^(.+?)\s*<(.+?)>$/);
-    const senderName = fromMatch ? fromMatch[1].replace(/"/g, '').trim() : from;
-    const senderEmail = fromMatch ? fromMatch[2].trim() : from;
-
-    // Extract body text (cap at 3000 chars to match DOM extraction)
-    const body = extractBody(message.payload).slice(0, 3000);
-
-    // Build Gmail URL for this email
-    const emailUrl = `https://mail.google.com/mail/u/0/#inbox/${messageId}`;
 
     return {
-      subject,
-      sender: { name: senderName, email: senderEmail },
-      body,
-      receivedDate: date,
-      extractedAt: new Date().toISOString(),
-      url: emailUrl,
-      source: 'gmail_api', // Distinguishes from DOM-extracted emails
-      gmailMessageId: messageId,
+      subject: getHeader('Subject') || '(no subject)',
+      sender: {
+        name: fromMatch ? fromMatch[1].replace(/"/g, '').trim() : from,
+        email: fromMatch ? fromMatch[2].trim() : from,
+      },
+      body: message.payload ? extractBody(message.payload).slice(0, MAX_BODY_LENGTH) : '',
+      receivedDate: getHeader('Date'),
+      url: `https://mail.google.com/mail/u/0/#inbox/${message.id}`,
     };
   }
-
-  // ── Delay utility ─────────────────────────────────────────────────
 
   function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // ── Main scan function ─────────────────────────────────────────────
-  // Fetches up to 50 inbox messages, processes each through the
-  // existing Parser → Scorer → Storage pipeline.
+  // ── Scan ───────────────────────────────────────────────────────────
 
   async function scanInbox() {
-    console.log('[GmailScanner] ═══════════════════════════════════════');
-    console.log('[GmailScanner] Starting inbox scan...');
-
-    const scanStart = Date.now();
-    let token;
-
-    try {
-      token = await getToken();
-    } catch (e) {
-      console.log('[GmailScanner] Not authenticated:', e.message);
+    if (!(await Auth.isAuthenticated())) {
       return {
         success: false,
         error: 'not_authenticated',
@@ -180,7 +179,8 @@ const GmailScanner = (() => {
       };
     }
 
-    let results = {
+    const scanStart = Date.now();
+    const results = {
       success: true,
       scanned: 0,
       newDeadlines: 0,
@@ -191,113 +191,33 @@ const GmailScanner = (() => {
     };
 
     try {
-      // Step 1: Get message list
-      const listResponse = await gmailApiCall(
-        `/users/me/messages?maxResults=${MAX_RESULTS}&labelIds=INBOX`,
-        token
+      const list = await gmailApiCall(
+        `/users/me/messages?maxResults=${MAX_RESULTS}&q=${encodeURIComponent(SEARCH_QUERY)}`
       );
+      const messageIds = (list.messages || []).map(m => m.id);
 
-      const messageIds = (listResponse.messages || []).map(m => m.id);
-      console.log(`[GmailScanner] Found ${messageIds.length} messages in inbox`);
-
-      if (messageIds.length === 0) {
-        results.scanTime = Date.now() - scanStart;
-        await saveScanStatus(results);
-        return results;
-      }
-
-      // Step 2: Fetch each message with full details
       for (let i = 0; i < messageIds.length; i++) {
+        if (i > 0) await delay(FETCH_DELAY_MS);
+
         try {
-          // Rate limiting
-          if (i > 0) await delay(FETCH_DELAY_MS);
-
-          const message = await gmailApiCall(
-            `/users/me/messages/${messageIds[i]}?format=full`,
-            token
-          );
-
-          const emailData = messageToEmailData(message);
+          const message = await gmailApiCall(`/users/me/messages/${messageIds[i]}?format=full`);
+          const emailData = toEmailData(message);
           results.scanned++;
 
-          // Step 3: Check deduplication
-          const fp = Deduplicator.fingerprint(emailData);
-          const alreadySeen = await Deduplicator.isDuplicate(fp);
-
-          if (alreadySeen) {
-            results.duplicates++;
-            continue;
-          }
-
-          // Step 4: Parse and score
-          const parsed = Parser.parse(emailData);
-          const scored = Scorer.score(parsed);
-
-          console.log(`[GmailScanner] ${i + 1}/${messageIds.length} | ` +
-            `"${emailData.subject.slice(0, 50)}" → ${scored.category} ` +
-            `(${scored.score}) → ${scored.action}`);
-
-          if (scored.action === 'ignore') {
+          if (shouldSkipEmail(emailData)) {
             results.ignored++;
             continue;
           }
 
-          // Step 5: Save deadline
-          const deadlineObj = {
-            id: fp,
-            subject: scored.emailSubject,
-            senderName: scored.senderName,
-            senderEmail: scored.senderEmail,
-            category: scored.category,
-            deadline: scored.deadline,
-            deadlineRaw: scored.deadlineRaw,
-            deadlineDaysFromNow: scored.deadlineDaysFromNow,
-            urgency: scored.urgency,
-            score: scored.score,
-            action: scored.action,
-            emailUrl: emailData.url,
-            savedAt: new Date().toISOString(),
-            status: scored.action === 'auto_save' ? 'pending' : 'confirm',
-            calendarEventId: null,
-            source: 'gmail_api',
-          };
-
-          const saveResult = await Storage.saveDeadline(deadlineObj);
-          await Deduplicator.markProcessed(fp);
-
-          if (saveResult.saved) {
-            results.newDeadlines++;
-
-            // Schedule notifications for this deadline
-            if (typeof Notifier !== 'undefined') {
-              try {
-                await Notifier.scheduleReminders(deadlineObj);
-              } catch (e) {
-                console.warn('[GmailScanner] Notification scheduling failed:', e.message);
-              }
-            }
-
-            // Auto-sync to calendar for high-confidence deadlines
-            if (scored.action === 'auto_save') {
-              try {
-                const authed = await Calendar.isAuthenticated();
-                if (authed) {
-                  await syncDeadlineToCalendar(fp);
-                }
-              } catch (e) {
-                console.warn('[GmailScanner] Calendar sync skipped:', e.message);
-              }
-            }
-          } else {
-            results.duplicates++;
-          }
-
-        } catch (msgError) {
-          console.warn(`[GmailScanner] Error processing message ${messageIds[i]}:`, msgError.message);
+          const { status } = await EmailPipeline.processEmail(emailData, 'gmail_api');
+          if (status === 'saved') results.newDeadlines++;
+          if (status === 'duplicate') results.duplicates++;
+          if (status === 'ignored') results.ignored++;
+        } catch (e) {
+          console.warn(`[GmailScanner] Failed to process message ${messageIds[i]}:`, e.message);
           results.errors++;
         }
       }
-
     } catch (e) {
       console.error('[GmailScanner] Scan failed:', e.message);
       results.success = false;
@@ -305,24 +225,13 @@ const GmailScanner = (() => {
     }
 
     results.scanTime = Date.now() - scanStart;
-    await saveScanStatus(results);
-
-    console.log('[GmailScanner] ─────────────────────────────────────────');
-    console.log(`[GmailScanner] Scan complete in ${results.scanTime}ms`);
-    console.log(`[GmailScanner] Scanned: ${results.scanned} | New: ${results.newDeadlines} | ` +
-      `Dupes: ${results.duplicates} | Ignored: ${results.ignored} | Errors: ${results.errors}`);
-    console.log('[GmailScanner] ═══════════════════════════════════════');
-
-    return results;
-  }
-
-  // ── Persist scan status ────────────────────────────────────────────
-
-  async function saveScanStatus(results) {
     await chrome.storage.local.set({
       lastScanTime: new Date().toISOString(),
       lastScanResults: results,
     });
+
+    console.log('[GmailScanner] Scan complete:', results);
+    return results;
   }
 
   async function getScanStatus() {
@@ -333,9 +242,5 @@ const GmailScanner = (() => {
     };
   }
 
-  return {
-    scanInbox,
-    getScanStatus,
-  };
-
+  return { scanInbox, getScanStatus };
 })();

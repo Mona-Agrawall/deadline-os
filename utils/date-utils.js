@@ -1,26 +1,15 @@
 // utils/date-utils.js
-// Normalizes all date formats we might find in emails into
-// a standard { date: Date, confidence: number, raw: string } object.
-// Never throws — always returns null on failure.
+// Turns date text found in emails ("tomorrow", "next Friday 3:00 PM",
+// "April 5, 2026", "05/04/2026") into a Date. Returns null if it can't.
 
 const DateUtils = (() => {
 
-  // Current year for resolving incomplete dates like "April 5"
+  // Used for dates written without a year, like "April 5"
   const CURRENT_YEAR = new Date().getFullYear();
 
   const MONTHS = {
-    january: 0, jan: 0,
-    february: 1, feb: 1,
-    march: 2, mar: 2,
-    april: 3, apr: 3,
-    may: 4,
-    june: 5, jun: 5,
-    july: 6, jul: 6,
-    august: 7, aug: 7,
-    september: 8, sep: 8, sept: 8,
-    october: 9, oct: 9,
-    november: 10, nov: 10,
-    december: 11, dec: 11,
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
   };
 
   const DAYS_OF_WEEK = {
@@ -33,115 +22,98 @@ const DateUtils = (() => {
     saturday: 6, sat: 6,
   };
 
-  // Resolve "next Monday", "this Friday" etc.
-  function resolveDayOfWeek(dayName, modifier) {
-    const today = new Date();
-    const todayDay = today.getDay();
-    const targetDay = DAYS_OF_WEEK[dayName.toLowerCase()];
-    if (targetDay === undefined) return null;
+  const MONTH_PATTERN =
+    'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|' +
+    'aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
+  const DAY_MONTH_REGEX = new RegExp(`(\\d{1,2})(?:st|nd|rd|th)?\\s+(${MONTH_PATTERN})\\s*,?\\s*(\\d{4})?`);
+  const MONTH_DAY_REGEX = new RegExp(`(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?\\s*,?\\s*(\\d{4})?`);
+  const DAY_OF_WEEK_REGEX =
+    /(next|this)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)/i;
 
-    let diff = targetDay - todayDay;
-    if (modifier === 'next' || diff <= 0) diff += 7;
-    const result = new Date(today);
-    result.setDate(today.getDate() + diff);
-    result.setHours(23, 59, 0, 0); // end of day default
-    return result;
+  // Deadlines without an explicit time default to 11:59 PM
+  function endOfDay(date) {
+    date.setHours(23, 59, 0, 0);
+    return date;
   }
 
-  // Resolve "tomorrow", "today", "in 3 days"
-  function resolveRelativeDay(text) {
-    const today = new Date();
+  // "today", "tomorrow", "in 3 days", "in 2 weeks"
+  function parseRelativeDay(text) {
     const lower = text.toLowerCase().trim();
+    const date = new Date();
 
-    if (lower === 'today') {
-      const d = new Date(today);
-      d.setHours(23, 59, 0, 0);
-      return d;
-    }
+    if (lower === 'today') return endOfDay(date);
+
     if (lower === 'tomorrow') {
-      const d = new Date(today);
-      d.setDate(d.getDate() + 1);
-      d.setHours(23, 59, 0, 0);
-      return d;
+      date.setDate(date.getDate() + 1);
+      return endOfDay(date);
     }
 
-    // "in X days/weeks"
     const inMatch = lower.match(/in\s+(\d+)\s+(day|week)s?/);
     if (inMatch) {
-      const n = parseInt(inMatch[1]);
-      const unit = inMatch[2];
-      const d = new Date(today);
-      d.setDate(d.getDate() + (unit === 'week' ? n * 7 : n));
-      d.setHours(23, 59, 0, 0);
-      return d;
+      const n = parseInt(inMatch[1], 10);
+      date.setDate(date.getDate() + (inMatch[2] === 'week' ? n * 7 : n));
+      return endOfDay(date);
     }
 
     return null;
   }
 
-  // Parse absolute dates: "April 5", "Apr 5, 2026", "5th April", "04/05/2026"
+  // "Monday", "this Friday", "next Tuesday" — always resolves to a future day
+  function parseDayOfWeek(text) {
+    const match = text.toLowerCase().match(DAY_OF_WEEK_REGEX);
+    if (!match) return null;
+
+    const [, modifier, dayName] = match;
+    const date = new Date();
+    let diff = DAYS_OF_WEEK[dayName] - date.getDay();
+    if (modifier === 'next' || diff <= 0) diff += 7;
+
+    date.setDate(date.getDate() + diff);
+    return endOfDay(date);
+  }
+
+  // "04/05/2026" (read as MM/DD/YYYY), "2026-04-05", "April 5", "5th April 2026"
   function parseAbsoluteDate(text) {
     const lower = text.toLowerCase().trim();
 
-    // MM/DD/YYYY or DD/MM/YYYY
     const slashMatch = lower.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
     if (slashMatch) {
-      const d = new Date(
-        parseInt(slashMatch[3]),
-        parseInt(slashMatch[1]) - 1,
-        parseInt(slashMatch[2])
-      );
-      if (!isNaN(d)) return d;
+      const [, month, day, year] = slashMatch.map(Number);
+      return new Date(year, month - 1, day);
     }
 
-    // YYYY-MM-DD (ISO format in email footers)
     const isoMatch = lower.match(/(\d{4})-(\d{2})-(\d{2})/);
     if (isoMatch) {
-      const d = new Date(
-        parseInt(isoMatch[1]),
-        parseInt(isoMatch[2]) - 1,
-        parseInt(isoMatch[3])
-      );
-      if (!isNaN(d)) return d;
+      const [, year, month, day] = isoMatch.map(Number);
+      return new Date(year, month - 1, day);
     }
 
-    // "April 5" or "April 5, 2026" or "5th April" or "5 April 2026"
-    const monthNameMatch = lower.match(
-      /(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*,?\s*(\d{4})?/
-    ) || lower.match(
-      /(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})?/
-    );
+    const dayMonth = lower.match(DAY_MONTH_REGEX);
+    const monthDay = !dayMonth && lower.match(MONTH_DAY_REGEX);
+    if (dayMonth || monthDay) {
+      const [dayText, monthText, yearText] = dayMonth
+        ? [dayMonth[1], dayMonth[2], dayMonth[3]]
+        : [monthDay[2], monthDay[1], monthDay[3]];
 
-    if (monthNameMatch) {
-      // Figure out which group is month vs day
-      let month, day, year;
-      const firstIsNum = /^\d/.test(monthNameMatch[1]);
-      if (firstIsNum) {
-        day = parseInt(monthNameMatch[1]);
-        month = MONTHS[monthNameMatch[2].slice(0, 3)];
-        year = monthNameMatch[3] ? parseInt(monthNameMatch[3]) : CURRENT_YEAR;
-      } else {
-        month = MONTHS[monthNameMatch[1].slice(0, 3)];
-        day = parseInt(monthNameMatch[2]);
-        year = monthNameMatch[3] ? parseInt(monthNameMatch[3]) : CURRENT_YEAR;
-      }
-      if (month !== undefined && day) {
-        const d = new Date(year, month, day, 23, 59, 0, 0);
-        if (!isNaN(d)) return d;
-      }
+      const day = parseInt(dayText, 10);
+      if (!day) return null;
+
+      const month = MONTHS[monthText.slice(0, 3)];
+      const year = yearText ? parseInt(yearText, 10) : CURRENT_YEAR;
+      return endOfDay(new Date(year, month, day));
     }
 
     return null;
   }
 
-  // Extract time from string: "3:00 PM", "15:00", "11:59 PM"
+  // "3:00 PM", "15:00", "11:59 pm" → { hours, minutes }
   function extractTime(text) {
-    const timeMatch = text.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
-    if (!timeMatch) return null;
+    const match = text.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+    if (!match) return null;
 
-    let hours = parseInt(timeMatch[1]);
-    const minutes = parseInt(timeMatch[2]);
-    const meridiem = timeMatch[3]?.toLowerCase();
+    let hours = parseInt(match[1], 10);
+    const minutes = parseInt(match[2], 10);
+    const meridiem = match[3]?.toLowerCase();
 
     if (meridiem === 'pm' && hours < 12) hours += 12;
     if (meridiem === 'am' && hours === 12) hours = 0;
@@ -149,52 +121,24 @@ const DateUtils = (() => {
     return { hours, minutes };
   }
 
-  // Master function — tries all strategies
   function parse(text) {
     if (!text) return null;
 
-    // Try relative first
-    const relative = resolveRelativeDay(text);
-    if (relative) {
-      const time = extractTime(text);
-      if (time) {
-        relative.setHours(time.hours, time.minutes, 0, 0);
-      }
-      return relative;
-    }
+    const date = parseRelativeDay(text) || parseDayOfWeek(text) || parseAbsoluteDate(text);
+    if (!date) return null;
 
-    // Try day-of-week
-    const dowMatch = text.toLowerCase().match(
-      /(next|this)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)/i
-    );
-    if (dowMatch) {
-      const resolved = resolveDayOfWeek(dowMatch[2], dowMatch[1]);
-      if (resolved) {
-        const time = extractTime(text);
-        if (time) resolved.setHours(time.hours, time.minutes, 0, 0);
-        return resolved;
-      }
-    }
-
-    // Try absolute date
-    const absolute = parseAbsoluteDate(text);
-    if (absolute) {
-      const time = extractTime(text);
-      if (time) absolute.setHours(time.hours, time.minutes, 0, 0);
-      return absolute;
-    }
-
-    return null;
+    const time = extractTime(text);
+    if (time) date.setHours(time.hours, time.minutes, 0, 0);
+    return date;
   }
 
   function isInFuture(date) {
-    return date && date > new Date();
+    return date > new Date();
   }
 
   function daysFromNow(date) {
-    const diff = date - new Date();
-    return Math.ceil(diff / (1000 * 60 * 60 * 24));
+    return Math.ceil((date - new Date()) / (1000 * 60 * 60 * 24));
   }
 
-  return { parse, isInFuture, daysFromNow, extractTime };
+  return { parse, isInFuture, daysFromNow };
 })();

@@ -1,0 +1,17 @@
+{
+  "name": "deadline-os",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension that finds deadlines in Gmail, reminds you, and syncs them to Google Calendar",
+  "author": "Mona Agrawal",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
